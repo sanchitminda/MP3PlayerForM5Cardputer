@@ -19,14 +19,15 @@
 
 /// set M5Speaker virtual channel (0-7)
 static constexpr uint8_t m5spk_virtual_channel = 0;
-
+bool isPaused = false;
 /// set your mp3 filename
 static constexpr const char* filename[] =
 {
   "/music.mp3"
 };
 static constexpr const size_t filecount = sizeof(filename) / sizeof(filename[0]);
-
+String filetoplay;
+char f[256];
 class AudioOutputM5Speaker : public AudioOutput
 {
   public:
@@ -188,7 +189,7 @@ static int16_t wave_h[WAVE_SIZE];
 static int16_t raw_data[WAVE_SIZE * 2];
 static int header_height = 0;
 static size_t fileindex = 0;
-
+uint32_t paused_at = 0;
 void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string)
 {
   (void)cbData;
@@ -225,6 +226,23 @@ void play(const char* fname)
   id3 = new AudioFileSourceID3(&file);
   id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
   id3->open(fname);
+  mp3.begin(id3, &out);
+}
+
+void pauseme(void){
+  paused_at = id3->getPos();
+  mp3.stop();
+  isPaused = true;
+}
+void resume(const char* fname){
+    if (id3 != nullptr) { stop(); }
+  M5Cardputer.Display.setCursor(0, 8);
+  file.open(fname);
+  id3 = new AudioFileSourceID3(&file);
+  id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
+  id3->open(fname);
+  id3->seek( paused_at,1 );
+  isPaused = false;
   mp3.begin(id3, &out);
 }
 
@@ -482,10 +500,11 @@ void setup(void)
     while (1);
     }
     listDir(SD, "/", 2);
+    fileindex = 0;
 }
-
+bool enableGraphic = false;
 void loop(void)
-{    
+{    if(enableGraphic)
   gfxLoop(&M5Cardputer.Display);
 
   if (mp3.isRunning())
@@ -503,9 +522,9 @@ void loop(void)
     M5Cardputer.Speaker.tone(1000, 100);
     stop();
     if (++fileindex >= no_of_files) { fileindex = 0; }
-    char f[200];
-    String filetoplay = files[fileindex];
-    filetoplay.toCharArray(f,200);
+
+    filetoplay = files[fileindex];
+    filetoplay.toCharArray(f,256);
     play(f);
   }
 
@@ -513,9 +532,35 @@ void loop(void)
   {
 
     size_t v = M5Cardputer.Speaker.getVolume();
+    if (M5Cardputer.Keyboard.isKeyPressed( 'p')){
+      if(isPaused){
 
+    filetoplay = files[fileindex];
+    filetoplay.toCharArray(f,256);
+    stop();
+        resume(f);
+      }
+      else{
+        pauseme();
+      }
+    }
+    if (M5Cardputer.Keyboard.isKeyPressed( 'n')){
+      if (++fileindex >= no_of_files) { fileindex = 0; }
+          filetoplay = files[fileindex];
+    filetoplay.toCharArray(f,256);
+    play(f);
+    }
+        if (M5Cardputer.Keyboard.isKeyPressed( 'b')){
+      if (--fileindex < 0) { fileindex = no_of_files; }
+          filetoplay = files[fileindex];
+    filetoplay.toCharArray(f,256);
+    play(f);
+    }
+    if (M5Cardputer.Keyboard.isKeyPressed( 'g')){
+      enableGraphic = !(enableGraphic);
+    }
     if (M5Cardputer.Keyboard.isKeyPressed( ';'))
-    { v+=10; 
+    {  v+=10; 
 } else if ( M5Cardputer.Keyboard.isKeyPressed( '.')) { v-=10; } 
     if (v <= 255 )
     {
