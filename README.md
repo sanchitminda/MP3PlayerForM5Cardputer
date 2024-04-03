@@ -5,7 +5,7 @@ How to use:
 Copy '.mp3' files into sd card and pulg into Cardputer press the 'BtnGo' to play
 for next song press 'BtnGo'
 To vhange the volume press arrow up(;) and down(.)
-Updates:
+Version 1.1 Updates:
 * directory scan option
 * n for next and b for previous song
 * p for play and pause
