@@ -1,8 +1,7 @@
-
 #include <HTTPClient.h>
 #include <math.h>
+#include <vector>
 
-/// need ESP8266Audio library. ( URL : https://github.com/earlephilhower/ESP8266Audio/ )
 #include <AudioOutput.h>
 #include <AudioFileSourceSD.h>
 #include <AudioFileSourceID3.h>
@@ -10,66 +9,67 @@
 #include "M5Cardputer.h"
 #include <M5Unified.h>
 #include <SPI.h>
-#include "handlefile.h"
 
+// --- Config & Pins ---
 #define SD_SPI_SCK_PIN  40
 #define SD_SPI_MISO_PIN 39
 #define SD_SPI_MOSI_PIN 14
 #define SD_SPI_CS_PIN   12
 
-/// set M5Speaker virtual channel (0-7)
-static constexpr uint8_t m5spk_virtual_channel = 0;
+// --- UI Layout Constants ---
+#define PLAYLIST_WIDTH 110
+#define ROW_HEIGHT 15
+#define MAX_VISIBLE_ROWS 8
+#define HEADER_HEIGHT 20
+
+// --- Global Audio Objects ---
+static AudioFileSourceSD *file = nullptr;
+static AudioFileSourceID3 *id3 = nullptr;
+static AudioGeneratorMP3 *mp3 = nullptr;
+class AudioOutputM5Speaker; // Forward declaration
+static AudioOutputM5Speaker *out = nullptr;
+
+// --- State Variables ---
+std::vector<String> songList;
+int currentFileIndex = 0;
 bool isPaused = false;
-/// set your mp3 filename
-static constexpr const char* filename[] =
-{
-  "/music.mp3"
-};
-static constexpr const size_t filecount = sizeof(filename) / sizeof(filename[0]);
-String filetoplay;
-char f[256];
+uint32_t paused_at = 0;
+String currentTitle = "";
+String currentArtist = "";
+
+// --- Custom Audio Output Class (Buffers audio for FFT) ---
 class AudioOutputM5Speaker : public AudioOutput
 {
   public:
-    AudioOutputM5Speaker(m5::Speaker_Class* m5sound, uint8_t virtual_sound_channel = 0)
-    {
+    AudioOutputM5Speaker(m5::Speaker_Class* m5sound, uint8_t virtual_sound_channel = 0) {
       _m5sound = m5sound;
       _virtual_ch = virtual_sound_channel;
     }
     virtual ~AudioOutputM5Speaker(void) {};
     virtual bool begin(void) override { return true; }
-    virtual bool ConsumeSample(int16_t sample[2]) override
-    {
-      if (_tri_buffer_index < tri_buf_size)
-      {
+    virtual bool ConsumeSample(int16_t sample[2]) override {
+      if (_tri_buffer_index < tri_buf_size) {
         _tri_buffer[_tri_index][_tri_buffer_index  ] = sample[0];
         _tri_buffer[_tri_index][_tri_buffer_index+1] = sample[1];
         _tri_buffer_index += 2;
-
         return true;
       }
-
       flush();
       return false;
     }
-    virtual void flush(void) override
-    {
-      if (_tri_buffer_index)
-      {
+    virtual void flush(void) override {
+      if (_tri_buffer_index) {
         _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, hertz, true, 1, _virtual_ch);
         _tri_index = _tri_index < 2 ? _tri_index + 1 : 0;
         _tri_buffer_index = 0;
       }
     }
-    virtual bool stop(void) override
-    {
+    virtual bool stop(void) override {
       flush();
       _m5sound->stop(_virtual_ch);
       return true;
     }
-
     const int16_t* getBuffer(void) const { return _tri_buffer[(_tri_index + 2) % 3]; }
-    const uint32_t getUpdateCount(void) const { return _update_count; }
   protected:
     m5::Speaker_Class* _m5sound;
     uint8_t _virtual_ch;
@@ -77,23 +77,19 @@ class AudioOutputM5Speaker : public AudioOutput
     int16_t _tri_buffer[3][tri_buf_size];
     size_t _tri_buffer_index = 0;
     size_t _tri_index = 0;
-    size_t _update_count = 0;
 };
 
-
+// --- FFT Processing Class ---
 #define FFT_SIZE 256
-class fft_t
-{
+class fft_t {
   float _wr[FFT_SIZE + 1];
   float _wi[FFT_SIZE + 1];
   float _fr[FFT_SIZE + 1];
   float _fi[FFT_SIZE + 1];
   uint16_t _br[FFT_SIZE + 1];
   size_t _ie;
-
 public:
-  fft_t(void)
-  {
+  fft_t(void) {
 #ifndef M_PI
 #define M_PI 3.141592653
 #endif
@@ -101,472 +97,345 @@ public:
     static constexpr float omega = 2.0f * M_PI / FFT_SIZE;
     static constexpr int s4 = FFT_SIZE / 4;
     static constexpr int s2 = FFT_SIZE / 2;
-    for ( int i = 1 ; i < s4 ; ++i)
-    {
-    float f = cosf(omega * i);
-      _wi[s4 + i] = f;
-      _wi[s4 - i] = f;
-      _wr[     i] = f;
-      _wr[s2 - i] = -f;
+    for ( int i = 1 ; i < s4 ; ++i) {
+      float f = cosf(omega * i);
+      _wi[s4 + i] = f; _wi[s4 - i] = f;
+      _wr[     i] = f; _wr[s2 - i] = -f;
     }
     _wi[s4] = _wr[0] = 1;
-
     size_t je = 1;
-    _br[0] = 0;
-    _br[1] = FFT_SIZE / 2;
-    for ( size_t i = 0 ; i < _ie - 1 ; ++i )
-    {
+    _br[0] = 0; _br[1] = FFT_SIZE / 2;
+    for ( size_t i = 0 ; i < _ie - 1 ; ++i ) {
       _br[ je << 1 ] = _br[ je ] >> 1;
       je = je << 1;
-      for ( size_t j = 1 ; j < je ; ++j )
-      {
-        _br[je + j] = _br[je] + _br[j];
-      }
+      for ( size_t j = 1 ; j < je ; ++j ) _br[je + j] = _br[je] + _br[j];
     }
   }
-
-  void exec(const int16_t* in)
-  {
+  void exec(const int16_t* in) {
     memset(_fi, 0, sizeof(_fi));
-    for ( size_t j = 0 ; j < FFT_SIZE / 2 ; ++j )
-    {
+    for ( size_t j = 0 ; j < FFT_SIZE / 2 ; ++j ) {
       float basej = 0.25 * (1.0-_wr[j]);
       size_t r = FFT_SIZE - j - 1;
-
-      /// perform han window and stereo to mono convert.
       _fr[_br[j]] = basej * (in[j * 2] + in[j * 2 + 1]);
       _fr[_br[r]] = basej * (in[r * 2] + in[r * 2 + 1]);
     }
-
-    size_t s = 1;
-    size_t i = 0;
-    do
-    {
-      size_t ke = s;
-      s <<= 1;
-      size_t je = FFT_SIZE / s;
-      size_t j = 0;
-      do
-      {
+    size_t s = 1; size_t i = 0;
+    do {
+      size_t ke = s; s <<= 1; size_t je = FFT_SIZE / s; size_t j = 0;
+      do {
         size_t k = 0;
-        do
-        {
-          size_t l = s * j + k;
-          size_t m = ke * (2 * j + 1) + k;
-          size_t p = je * k;
+        do {
+          size_t l = s * j + k; size_t m = ke * (2 * j + 1) + k; size_t p = je * k;
           float Wxmr = _fr[m] * _wr[p] + _fi[m] * _wi[p];
           float Wxmi = _fi[m] * _wr[p] - _fr[m] * _wi[p];
-          _fr[m] = _fr[l] - Wxmr;
-          _fi[m] = _fi[l] - Wxmi;
-          _fr[l] += Wxmr;
-          _fi[l] += Wxmi;
+          _fr[m] = _fr[l] - Wxmr; _fi[m] = _fi[l] - Wxmi;
+          _fr[l] += Wxmr; _fi[l] += Wxmi;
         } while ( ++k < ke) ;
       } while ( ++j < je );
     } while ( ++i < _ie );
   }
-
-  uint32_t get(size_t index)
-  {
+  uint32_t get(size_t index) {
     return (index < FFT_SIZE / 2) ? (uint32_t)sqrtf(_fr[ index ] * _fr[ index ] + _fi[ index ] * _fi[ index ]) : 0u;
   }
 };
-// static constexpr const int preallocateBufferSize = 128 * 1024;
-// static constexpr const int preallocateCodecSize = 85332; // MP3 and AAC+SBR codec max mem needed
-// static void* preallocateBuffer = nullptr;
-// static void* preallocateCodec = nullptr;
+
+// --- Visualizer Globals ---
 static constexpr size_t WAVE_SIZE = 320;
-static AudioFileSourceSD file;
-static AudioOutputM5Speaker out(&M5Cardputer.Speaker, m5spk_virtual_channel);
-static AudioGeneratorMP3 mp3;
-static AudioFileSourceID3* id3 = nullptr;
 static fft_t fft;
-static bool fft_enabled = false;
-static bool wave_enabled = false;
 static uint16_t prev_y[(FFT_SIZE / 2)+1];
-static uint16_t peak_y[(FFT_SIZE / 2)+1];
-static int16_t wave_y[WAVE_SIZE];
-static int16_t wave_h[WAVE_SIZE];
 static int16_t raw_data[WAVE_SIZE * 2];
-static int header_height = 0;
-static size_t fileindex = 0;
-uint32_t paused_at = 0;
-void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string)
-{
+
+// --- Drawing Functions ---
+
+// 1. Draw the Sidebar (Playlist)
+void drawPlaylist() {
+  M5Cardputer.Display.setFont(&fonts::Font0); // Small font for list
+  int totalSongs = songList.size();
+  
+  // Calculate scroll offset to keep current song in view
+  int startIdx = 0;
+  if (currentFileIndex >= MAX_VISIBLE_ROWS) {
+    startIdx = currentFileIndex - (MAX_VISIBLE_ROWS - 1);
+  }
+  
+  int yPos = HEADER_HEIGHT + 5;
+  int xPos = 0;
+
+  // Clear Playlist Area
+  M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, PLAYLIST_WIDTH, M5Cardputer.Display.height() - HEADER_HEIGHT, TFT_BLACK);
+  M5Cardputer.Display.drawFastVLine(PLAYLIST_WIDTH, HEADER_HEIGHT, M5Cardputer.Display.height() - HEADER_HEIGHT, TFT_DARKGREY);
+
+  for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
+    int actualIdx = startIdx + i;
+    if (actualIdx >= totalSongs) break;
+
+    // Highlight current song
+    if (actualIdx == currentFileIndex) {
+      M5Cardputer.Display.fillRect(xPos, yPos, PLAYLIST_WIDTH - 2, ROW_HEIGHT, 0x00AA00U); // Green highlight
+      M5Cardputer.Display.setTextColor(TFT_WHITE);
+    } else {
+      M5Cardputer.Display.setTextColor(TFT_LIGHTGREY);
+    }
+    
+    // Clean filename for display (remove slashes and .mp3)
+    String dispName = songList[actualIdx];
+    dispName.replace("/", "");
+    dispName.replace(".mp3", "");
+    dispName.replace(".MP3", "");
+    
+    M5Cardputer.Display.setCursor(xPos + 4, yPos + 3);
+    M5Cardputer.Display.print(dispName.substring(0, 14)); // truncate
+    yPos += ROW_HEIGHT;
+  }
+}
+
+// 2. Draw "Now Playing" Info
+void drawNowPlayingInfo() {
+  int xStart = PLAYLIST_WIDTH + 5;
+  int yStart = HEADER_HEIGHT + 5;
+  int w = M5Cardputer.Display.width() - xStart;
+
+  // Clear Info Area (Top half of Right Pane)
+  M5Cardputer.Display.fillRect(xStart, yStart, w, 45, TFT_BLACK);
+
+  M5Cardputer.Display.setFont(&fonts::lgfxJapanGothic_12);
+  M5Cardputer.Display.setTextColor(TFT_YELLOW);
+  M5Cardputer.Display.setCursor(xStart, yStart);
+  
+  if (isPaused) {
+    M5Cardputer.Display.print("[ PAUSED ]");
+  } else {
+    M5Cardputer.Display.print("NOW PLAYING:");
+  }
+
+  M5Cardputer.Display.setTextColor(TFT_WHITE);
+  M5Cardputer.Display.setCursor(xStart, yStart + 15);
+  if (currentTitle.length() > 0) {
+    M5Cardputer.Display.print(currentTitle.substring(0, 15));
+  } else {
+    String f = songList[currentFileIndex];
+    f.replace("/", "");
+    M5Cardputer.Display.print(f.substring(0, 15));
+  }
+
+  // Volume Bar
+  int vol = M5Cardputer.Speaker.getVolume();
+  M5Cardputer.Display.drawRect(xStart, yStart + 35, 100, 6, TFT_DARKGREY);
+  M5Cardputer.Display.fillRect(xStart + 1, yStart + 36, (vol * 98) / 255, 4, TFT_CYAN);
+}
+
+// 3. ID3 Callback
+void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string) {
   (void)cbData;
-  if (string[0] == 0) { return; }
-  if (strcmp(type, "eof") == 0)
-  {
-    M5Cardputer.Display.display();
-    return;
+  if (string[0] == 0) return;
+  
+  if (strcmp(type, "Title") == 0) {
+    currentTitle = String(string);
+    drawNowPlayingInfo(); // Update UI immediately
+  } 
+  else if (strcmp(type, "Artist") == 0) {
+    currentArtist = String(string);
   }
-  int y = M5Cardputer.Display.getCursorY();
-  if (y+1 >= header_height) { return; }
-  M5Cardputer.Display.fillRect(0, y, M5Cardputer.Display.width(), 12, M5Cardputer.Display.getBaseColor());
-  M5Cardputer.Display.printf("%s: %s", type, string);
-  M5Cardputer.Display.setCursor(0, y+12);
 }
 
-void stop(void)
-{
-  if (id3 == nullptr) return;
-  out.stop();
-  mp3.stop();
-  id3->RegisterMetadataCB(nullptr, nullptr);
-  id3->close();
-  file.close();
-  delete id3;
-  id3 = nullptr;
+// 4. Draw Visualizer (Restricted to Right Pane)
+void drawVisualizer(LGFX_Device* gfx) {
+  if (!mp3 || !mp3->isRunning() || isPaused) return;
+
+  auto buf = out->getBuffer();
+  if (buf) {
+    memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t));
+    
+    // Define Visualizer Bounds
+    int visX = PLAYLIST_WIDTH + 2;
+    int visY = HEADER_HEIGHT + 50; // Below info text
+    int visW = gfx->width() - visX;
+    int visH = gfx->height() - visY;
+
+    if (visH < 10) return; // Not enough space
+
+    gfx->startWrite();
+    fft.exec(raw_data);
+
+    int barWidth = 4;
+    int numBars = visW / barWidth;
+    if (numBars > FFT_SIZE / 2) numBars = FFT_SIZE / 2;
+
+    for (size_t bx = 0; bx < numBars; ++bx) {
+      int x = visX + (bx * barWidth);
+      
+      // Get FFT Value and scale to height
+      int32_t f = fft.get(bx);
+      int32_t barH = (f * visH) >> 16; 
+      if (barH > visH) barH = visH;
+      
+      // Draw Bars
+      int yTop = (visY + visH) - barH;
+      
+      // Erase previous top (simplistic erase)
+      gfx->fillRect(x, visY, barWidth - 1, visH - barH, TFT_BLACK);
+      // Draw new bar
+      gfx->fillRect(x, yTop, barWidth - 1, barH, TFT_MAGENTA);
+    }
+    gfx->endWrite();
+  }
 }
 
-void play(const char* fname)
-{
-  if (id3 != nullptr) { stop(); }
-  M5Cardputer.Display.setCursor(0, 8);
-  file.open(fname);
-  id3 = new AudioFileSourceID3(&file);
+// --- Audio Control Functions ---
+
+void stop_audio() {
+  if (mp3) { mp3->stop(); delete mp3; mp3 = nullptr; }
+  if (id3) { id3->close(); delete id3; id3 = nullptr; }
+  if (file) { file->close(); delete file; file = nullptr; }
+}
+
+void play_current() {
+  stop_audio();
+  if (songList.empty()) return;
+
+  currentTitle = "";
+  currentArtist = "";
+  drawPlaylist();
+  drawNowPlayingInfo();
+
+  String fname = songList[currentFileIndex];
+  file = new AudioFileSourceSD(fname.c_str());
+  id3 = new AudioFileSourceID3(file);
   id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
-  id3->open(fname);
-  mp3.begin(id3, &out);
-}
-
-void pauseme(void){
-  paused_at = id3->getPos();
-  mp3.stop();
-  isPaused = true;
-}
-void resume(const char* fname){
-    if (id3 != nullptr) { stop(); }
-  M5Cardputer.Display.setCursor(0, 8);
-  file.open(fname);
-  id3 = new AudioFileSourceID3(&file);
-  id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
-  id3->open(fname);
-  id3->seek( paused_at,1 );
+  mp3 = new AudioGeneratorMP3();
+  mp3->begin(id3, out);
   isPaused = false;
-  mp3.begin(id3, &out);
 }
 
-uint32_t bgcolor(LGFX_Device* gfx, int y)
-{
-  auto h = gfx->height();
-  auto dh = h - header_height;
-  int v = ((h - y)<<5) / dh;
-  if (dh > 44)
-  {
-    int v2 = ((h - y - 1)<<5) / dh;
-    if ((v >> 2) != (v2 >> 2))
-    {
-      return 0x666666u;
-    }
-  }
-  return gfx->color888(v + 2, v, v + 6);
-}
-
-void gfxSetup(LGFX_Device* gfx)
-{
-  if (gfx == nullptr) { return; }
-  // if (gfx->width() < gfx->height())
-  // {
-    gfx->setRotation(1);
-  // }
-  gfx->setFont(&fonts::lgfxJapanGothic_12);
-  gfx->setEpdMode(epd_mode_t::epd_fastest);
-  gfx->setCursor(0, 8);
-  gfx->println("MP3 player");
-  gfx->setTextWrap(false);
-  gfx->fillRect(0, 6, gfx->width(), 2, TFT_BLACK);
-  header_height = (gfx->height() > 100) ? 33 : 21;
-  fft_enabled = !gfx->isEPD();
-  if (fft_enabled)
-  {
-    wave_enabled = (gfx->getBoard() != m5gfx::board_M5UnitLCD);
-
-    for (int y = header_height; y < gfx->height(); ++y)
-    {
-      gfx->drawFastHLine(0, y, gfx->width(), bgcolor(gfx, y));
-    }
-  }
-
-  for (int x = 0; x < (FFT_SIZE/2)+1; ++x)
-  {
-    prev_y[x] = INT16_MAX;
-    peak_y[x] = INT16_MAX;
-  }
-  for (int x = 0; x < WAVE_SIZE; ++x)
-  {
-    wave_y[x] = gfx->height();
-    wave_h[x] = 0;
+void pause_audio() {
+  if (mp3 && mp3->isRunning()) {
+    paused_at = id3->getPos();
+    mp3->stop();
+    isPaused = true;
+    drawNowPlayingInfo();
   }
 }
 
-void gfxLoop(LGFX_Device* gfx)
-{
-  if (gfx == nullptr) { return; }
-
-  if (!gfx->displayBusy())
-  { // draw volume bar
-    static int px;
-    uint8_t v = M5Cardputer.Speaker.getVolume();
-    int x = v * (gfx->width()) >> 8;
-    if (px != x)
-    {
-      gfx->fillRect(x, 6, px - x, 2, px < x ? 0xAAFFAAu : 0u);
-      gfx->display();
-      px = x;
-    }
-  }
-
-  if (fft_enabled && !gfx->displayBusy() && M5Cardputer.Speaker.isPlaying(m5spk_virtual_channel) > 1)
-  {
-    static int prev_x[2];
-    static int peak_x[2];
-
-    auto buf = out.getBuffer();
-    if (buf)
-    {
-      memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t)); // stereo data copy
-      gfx->startWrite();
-
-      // draw stereo level meter
-      for (size_t i = 0; i < 2; ++i)
-      {
-        int32_t level = 0;
-        for (size_t j = i; j < 640; j += 32)
-        {
-          uint32_t lv = abs(raw_data[j]);
-          if (level < lv) { level = lv; }
-        }
-
-        int32_t x = (level * gfx->width()) / INT16_MAX;
-        int32_t px = prev_x[i];
-        if (px != x)
-        {
-          gfx->fillRect(x, i * 3, px - x, 2, px < x ? 0xFF9900u : 0x330000u);
-          prev_x[i] = x;
-        }
-        px = peak_x[i];
-        if (px > x)
-        {
-          gfx->writeFastVLine(px, i * 3, 2, TFT_BLACK);
-          px--;
-        }
-        else
-        {
-          px = x;
-        }
-        if (peak_x[i] != px)
-        {
-          peak_x[i] = px;
-          gfx->writeFastVLine(px, i * 3, 2, TFT_WHITE);
-        }
-      }
-      gfx->display();
-
-      // draw FFT level meter
-      fft.exec(raw_data);
-      size_t bw = gfx->width() / 60;
-      if (bw < 3) { bw = 3; }
-      int32_t dsp_height = gfx->height();
-      int32_t fft_height = dsp_height - header_height - 1;
-      size_t xe = gfx->width() / bw;
-      if (xe > (FFT_SIZE/2)) { xe = (FFT_SIZE/2); }
-      int32_t wave_next = ((header_height + dsp_height) >> 1) + (((256 - (raw_data[0] + raw_data[1])) * fft_height) >> 17);
-
-      uint32_t bar_color[2] = { 0x000033u, 0x99AAFFu };
-
-      for (size_t bx = 0; bx <= xe; ++bx)
-      {
-        size_t x = bx * bw;
-        if ((x & 7) == 0) { gfx->display(); taskYIELD(); }
-        int32_t f = fft.get(bx);
-        int32_t y = (f * fft_height) >> 18;
-        if (y > fft_height) { y = fft_height; }
-        y = dsp_height - y;
-        int32_t py = prev_y[bx];
-        if (y != py)
-        {
-          gfx->fillRect(x, y, bw - 1, py - y, bar_color[(y < py)]);
-          prev_y[bx] = y;
-        }
-        py = peak_y[bx] + 1;
-        if (py < y)
-        {
-          gfx->writeFastHLine(x, py - 1, bw - 1, bgcolor(gfx, py - 1));
-        }
-        else
-        {
-          py = y - 1;
-        }
-        if (peak_y[bx] != py)
-        {
-          peak_y[bx] = py;
-          gfx->writeFastHLine(x, py, bw - 1, TFT_WHITE);
-        }
-
-
-        if (wave_enabled)
-        {
-          for (size_t bi = 0; bi < bw; ++bi)
-          {
-            size_t i = x + bi;
-            if (i >= gfx->width() || i >= WAVE_SIZE) { break; }
-            y = wave_y[i];
-            int32_t h = wave_h[i];
-            bool use_bg = (bi+1 == bw);
-            if (h>0)
-            { /// erase previous wave.
-              gfx->setAddrWindow(i, y, 1, h);
-              h += y;
-              do
-              {
-                uint32_t bg = (use_bg || y < peak_y[bx]) ? bgcolor(gfx, y)
-                            : (y == peak_y[bx]) ? 0xFFFFFFu
-                            : bar_color[(y >= prev_y[bx])];
-                gfx->writeColor(bg, 1);
-              } while (++y < h);
-            }
-            size_t i2 = i << 1;
-            int32_t y1 = wave_next;
-            wave_next = ((header_height + dsp_height) >> 1) + (((256 - (raw_data[i2] + raw_data[i2 + 1])) * fft_height) >> 17);
-            int32_t y2 = wave_next;
-            if (y1 > y2)
-            {
-              int32_t tmp = y1;
-              y1 = y2;
-              y2 = tmp;
-            }
-            y = y1;
-            h = y2 + 1 - y;
-            wave_y[i] = y;
-            wave_h[i] = h;
-            if (h>0)
-            { /// draw new wave.
-              gfx->setAddrWindow(i, y, 1, h);
-              h += y;
-              do
-              {
-                uint32_t bg = (y < prev_y[bx]) ? 0xFFCC33u : 0xFFFFFFu;
-                gfx->writeColor(bg, 1);
-              } while (++y < h);
-            }
-          }
-        }
-      }
-      gfx->display();
-      gfx->endWrite();
-    }
-  }
+void resume_audio() {
+  if (!isPaused || songList.empty()) return;
+  stop_audio();
+  
+  String fname = songList[currentFileIndex];
+  file = new AudioFileSourceSD(fname.c_str());
+  id3 = new AudioFileSourceID3(file);
+  id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
+  id3->seek(paused_at, 1);
+  mp3 = new AudioGeneratorMP3();
+  mp3->begin(id3, out);
+  isPaused = false;
+  drawNowPlayingInfo();
 }
 
-void setup(void)
-{
+// --- Setup & Loop ---
+
+void setup() {
   auto cfg = M5.config();
-
-  // If you want to play sound from ModuleDisplay, write this
-//  cfg.external_speaker.module_display = true;
-
-  // If you want to play sound from ModuleRCA, write this
-//  cfg.external_speaker.module_rca     = true;
-
-  // If you want to play sound from HAT Speaker, write this
-  cfg.external_speaker.hat_spk        = true;
-
-  // If you want to play sound from HAT Speaker2, write this
-//  cfg.external_speaker.hat_spk2       = true;
-
-  // If you want to play sound from ATOMIC Speaker, write this
-  // cfg.external_speaker.atomic_spk     = true;
-
+  cfg.external_speaker.hat_spk = true;
   M5Cardputer.begin(cfg);
+  
+  // Audio Config
+  auto spk_cfg = M5Cardputer.Speaker.config();
+  spk_cfg.sample_rate = 128000;
+  spk_cfg.task_pinned_core = APP_CPU_NUM;
+  M5Cardputer.Speaker.config(spk_cfg);
+  out = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
 
+  // Graphics Setup
+  M5Cardputer.Display.setRotation(1);
+  M5Cardputer.Display.fillScreen(TFT_BLACK);
+  
+  // Draw Header
+  M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, TFT_NAVY);
+  M5Cardputer.Display.setTextDatum(middle_center);
+  M5Cardputer.Display.setTextColor(TFT_WHITE);
+  M5Cardputer.Display.drawString("M5Cardputer Player", M5Cardputer.Display.width() / 2, HEADER_HEIGHT / 2);
+  M5Cardputer.Display.setTextDatum(top_left);
 
-  { /// custom setting
-    auto spk_cfg = M5Cardputer.Speaker.config();
-    /// Increasing the sample_rate will improve the sound quality instead of increasing the CPU load.
-    spk_cfg.sample_rate = 128000; // default:64000 (64kHz)  e.g. 48000 , 50000 , 80000 , 96000 , 100000 , 128000 , 144000 , 192000 , 200000
-    spk_cfg.task_pinned_core = APP_CPU_NUM;
-    M5Cardputer.Speaker.config(spk_cfg);
+  // SD Init
+  SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
+  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
+    M5Cardputer.Display.setCursor(10, 40);
+    M5Cardputer.Display.print("SD Card Failed");
+    while(1);
   }
-  gfxSetup(&M5Cardputer.Display);
 
-    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
-
-    if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
-        // Print a message if the SD card initialization
-        // fails orif the SD card does not exist.
-        M5Cardputer.Display.drawString("SD Not Found",
-                                   M5Cardputer.Display.width() / 2,
-                                   M5Cardputer.Display.height() / 2);
-    while (1);
+  // Scan Files
+  File root = SD.open("/");
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    if (!entry.isDirectory()) {
+      String name = entry.name();
+      if (name.endsWith(".mp3") || name.endsWith(".MP3")) {
+        if (!name.startsWith("/")) name = "/" + name;
+        songList.push_back(name);
+      }
     }
-    listDir(SD, "/", 2);
-    fileindex = 0;
+    entry.close();
+  }
+
+  if (songList.size() > 0) {
+    play_current();
+  } else {
+    M5Cardputer.Display.setCursor(10, 40);
+    M5Cardputer.Display.print("No MP3 Files!");
+  }
 }
-bool enableGraphic = false;
-void loop(void)
-{    if(enableGraphic)
-  gfxLoop(&M5Cardputer.Display);
 
-  if (mp3.isRunning())
-  {
-    if (!mp3.loop()) { mp3.stop(); }
-  }
-  else
-  {
-    delay(1);
-  }
-
+void loop() {
   M5Cardputer.update();
-  if (M5Cardputer.BtnA.wasClicked())
-  {
-    M5Cardputer.Speaker.tone(1000, 100);
-    stop();
-    if (++fileindex >= no_of_files) { fileindex = 0; }
 
-    filetoplay = files[fileindex];
-    filetoplay.toCharArray(f,256);
-    play(f);
+  // Audio Loop
+  if (mp3 && mp3->isRunning()) {
+    if (!mp3->loop()) { 
+      // Song finished, go to next
+      mp3->stop();
+      currentFileIndex++;
+      if (currentFileIndex >= songList.size()) currentFileIndex = 0;
+      play_current();
+    }
+    // Update visualizer often
+    drawVisualizer(&M5Cardputer.Display);
   }
 
-  if (M5Cardputer.Keyboard.isChange())
-  {
+  // Key Handling
+  if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+    
+    // Play/Pause (P)
+    if (M5Cardputer.Keyboard.isKeyPressed('p')) {
+      if (isPaused) resume_audio();
+      else pause_audio();
+    }
 
-    size_t v = M5Cardputer.Speaker.getVolume();
-    if (M5Cardputer.Keyboard.isKeyPressed( 'p')){
-      if(isPaused){
+    // Next Track (N or Right Arrow)
+    if (M5Cardputer.Keyboard.isKeyPressed('n') || M5Cardputer.Keyboard.isKeyPressed('/')) {
+      currentFileIndex++;
+      if (currentFileIndex >= songList.size()) currentFileIndex = 0;
+      play_current();
+    }
 
-    filetoplay = files[fileindex];
-    filetoplay.toCharArray(f,256);
-    stop();
-        resume(f);
-      }
-      else{
-        pauseme();
-      }
+    // Prev Track (B or Left Arrow)
+    if (M5Cardputer.Keyboard.isKeyPressed('b') || M5Cardputer.Keyboard.isKeyPressed(',')) {
+      currentFileIndex--;
+      if (currentFileIndex < 0) currentFileIndex = songList.size() - 1;
+      play_current();
     }
-    if (M5Cardputer.Keyboard.isKeyPressed( 'n')){
-      if (++fileindex >= no_of_files) { fileindex = 0; }
-          filetoplay = files[fileindex];
-    filetoplay.toCharArray(f,256);
-    play(f);
-    }
-        if (M5Cardputer.Keyboard.isKeyPressed( 'b')){
-      if (--fileindex < 0) { fileindex = no_of_files; }
-          filetoplay = files[fileindex];
-    filetoplay.toCharArray(f,256);
-    play(f);
-    }
-    if (M5Cardputer.Keyboard.isKeyPressed( 'g')){
-      enableGraphic = !(enableGraphic);
-    }
-    if (M5Cardputer.Keyboard.isKeyPressed( ';'))
-    {  v+=10; 
-} else if ( M5Cardputer.Keyboard.isKeyPressed( '.')) { v-=10; } 
-    if (v <= 255 )
-    {
-                                  
+
+    // Volume (; / .)
+    int v = (int)M5Cardputer.Speaker.getVolume();
+    bool volChanged = false;
+    if (M5Cardputer.Keyboard.isKeyPressed(';')) { v += 10; volChanged = true; }
+    if (M5Cardputer.Keyboard.isKeyPressed('.')) { v -= 10; volChanged = true; }
+    
+    if (volChanged) {
+      if (v > 255) v = 255; if (v < 0) v = 0;
       M5Cardputer.Speaker.setVolume(v);
+      drawNowPlayingInfo(); // Update volume bar
     }
   }
-
 }
