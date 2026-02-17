@@ -119,6 +119,7 @@ void loadConfig() {
 }
 
 // --- BATTERY ---
+// --- BATTERY ---
 void drawBattery() {
     int batLevel = M5.Power.getBatteryLevel();
     bool isCharging = M5.Power.isCharging();
@@ -126,22 +127,40 @@ void drawBattery() {
     int x = M5Cardputer.Display.width() - w - 5; 
     int y = 5;
 
-    M5Cardputer.Display.fillRect(x - 25, 0, w + 30, HEADER_HEIGHT, C_HEADER); 
+    // Clear background area for text and battery
+    M5Cardputer.Display.fillRect(x - 30, 0, w + 35, HEADER_HEIGHT, C_HEADER); 
+
+    // Draw Battery Outline
     M5Cardputer.Display.drawRect(x, y, w, h, C_TEXT_MAIN);
     M5Cardputer.Display.fillRect(x + w, y + 2, 2, 6, C_TEXT_MAIN);
 
+    // Determine Color
     uint16_t color = C_PLAYING;
-    if (isCharging) color = C_ACCENT;
+    if (isCharging) color = C_ACCENT; // Cyan when charging
     else if (batLevel < 20) color = TFT_RED;
     else if (batLevel < 50) color = TFT_YELLOW;
 
+    // Draw Battery Fill
     int fillW = map(batLevel, 0, 100, 0, w - 2);
     if (fillW < 0) fillW = 0;
     M5Cardputer.Display.fillRect(x + 1, y + 1, fillW, h - 2, color);
 
+    // --- NEW: DRAW CHARGING BOLT SYMBOL ---
+    if (isCharging) {
+        // Draw a lightning bolt using two triangles in White
+        // Top triangle
+        M5Cardputer.Display.fillTriangle(x + 14, y + 2, x + 8, y + 5, x + 14, y + 5, TFT_WHITE);
+        // Bottom triangle
+        M5Cardputer.Display.fillTriangle(x + 10, y + 5, x + 16, y + 5, x + 10, y + 8, TFT_WHITE);
+    }
+
+    // Draw Percentage Text
     M5Cardputer.Display.setFont(&fonts::Font0);
     M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
-    M5Cardputer.Display.setCursor(x - 22, y + 1);
+    M5Cardputer.Display.setCursor(x - 25, y + 1); // Adjusted position slightly left
+    
+    if (batLevel == 100) M5Cardputer.Display.setCursor(x - 29, y + 1); // Shift for 3 digits
+    
     M5Cardputer.Display.print(batLevel);
     M5Cardputer.Display.print("%");
 }
@@ -736,6 +755,31 @@ void setup() {
 // --- LOOP ---
 void loop() {
   M5Cardputer.update();
+
+  // --- NEW: BTN A (G0) HANDLING ---
+  if( M5Cardputer.BtnA.wasDecideClickCount()){
+  // getClickCount() returns the number of clicks after a brief timeout
+    int clicks = M5Cardputer.BtnA.getClickCount();
+    
+    if (clicks > 0) {
+        if (clicks == 1) {
+            // 1 Click: Play / Pause
+            if (songList.size() > 0) {
+                if (isPaused) resume_audio(); 
+                else pause_audio();
+                saveConfig(); // Save state
+            }
+        } 
+        else if (clicks == 2) {
+            // 2 Clicks: Next Song
+            next_song(false);
+        } 
+        else if (clicks == 3) {
+            // 3 Clicks: Previous Song
+            prev_song();
+        }
+    }
+  }
 
   // Screen Timeout
   if (userSettings.timeoutIndex > 0 && !isScreenOff) {
