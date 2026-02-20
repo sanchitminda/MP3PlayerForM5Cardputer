@@ -1,4 +1,4 @@
-#include <vector>
+ #include <vector>
 #include <M5Unified.h>
 #include <M5Cardputer.h>
 #include <SPI.h>
@@ -37,6 +37,9 @@
 #define MAX_VISIBLE_ROWS 6      
 
 // --- GLOBALS ---
+const int TOTAL_SETTINGS = 5;      // Total number of items in the menu
+const int MAX_MENU_ROWS = 4;       // How many items fit on the screen at once
+int menuScrollOffset = 0;          // Tracks which item is at the top of the menu
 enum LoopState { NO_LOOP, LOOP_ALL, LOOP_ONE };
 std::vector<String> songList;
 
@@ -68,34 +71,43 @@ static AudioOutputM5Speaker *out = nullptr;
 LGFX_Sprite visSprite(&M5Cardputer.Display);
 
 // --- SETTINGS ---
+const uint32_t sampleRateValues[] = { 44100, 48000, 88200, 96000, 128000 };
+const char* sampleRateLabels[] = { "44.1k", "48k", "88.2k", "96k", "128k" };
+
 struct Settings {
     int brightness = 100;      
     int timeoutIndex = 0;      
     bool resumePlay = true;    
+    int spkRateIndex = 4;      // NEW: Defaults to index 4 (128000 Hz)
     int lastIndex = 0;         
     uint32_t lastPos = 0;      
 };
 Settings userSettings;
 bool showSettingsMenu = false;
 int settingsCursor = 0; 
-
+// --- GLOBALS ---
+std::vector<uint32_t> songOffsets; // Stores file byte positions instead of Strings
 unsigned long lastInputTime = 0;
 bool isScreenOff = false;
 const long timeoutValues[] = { 0, 30000, 60000, 120000, 300000 };
 const char* timeoutLabels[] = { "Always On", "30 Sec", "1 Min", "2 Min", "5 Min" };
 
+
 // --- CONFIG FUNCTIONS ---
 void saveConfig() {
-    if (mp3 && mp3->isRunning() && id3) {
+    // --- NEW: Always save the position, even if it's paused! ---
+    if (id3) {
         userSettings.lastIndex = currentFileIndex;
-        userSettings.lastPos = id3->getPos();
+        userSettings.lastPos = isPaused ? paused_at : id3->getPos();
     }
+    
     if (SD.exists(CONFIG_FILE)) SD.remove(CONFIG_FILE);
     File file = SD.open(CONFIG_FILE, FILE_WRITE);
     if (file) {
         file.println(userSettings.brightness);
         file.println(userSettings.timeoutIndex);
         file.println(userSettings.resumePlay ? 1 : 0);
+        file.println(userSettings.spkRateIndex); // Your new hardware rate
         file.println(userSettings.lastIndex);
         file.println(userSettings.lastPos);
         file.close();
@@ -118,10 +130,24 @@ void loadConfig() {
     }
 }
 
-// --- BATTERY ---
+void drawHeader() {
+    // Fill the header background
+    M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
+    
+    // Set text properties
+    M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
+    M5Cardputer.Display.setFont(&fonts::Font0); 
+    
+    // Format: "Music Player [15/342]"
+    String headerText = "Music Player [" + String(currentFileIndex + 1) + "/" + String(songOffsets.size()) + "]";
+    M5Cardputer.Display.drawString(headerText.c_str(), 10, 5); 
+    
+    // Draw the battery on top of the right side
+    drawBattery(); 
+}
 // --- BATTERY ---
 void drawBattery() {
-    int batLevel = M5.Power.getBatteryLevel();
+    int batLevel = M5Cardputer.Power.getBatteryLevel();
     bool isCharging = M5.Power.isCharging();
     int w = 24; int h = 10;
     int x = M5Cardputer.Display.width() - w - 5; 
@@ -145,9 +171,8 @@ void drawBattery() {
     if (fillW < 0) fillW = 0;
     M5Cardputer.Display.fillRect(x + 1, y + 1, fillW, h - 2, color);
 
-    // --- NEW: DRAW CHARGING BOLT SYMBOL ---
+    // --- FIXED: ONLY draw the bolt if charging ---
     if (isCharging) {
-        // Draw a lightning bolt using two triangles in White
         // Top triangle
         M5Cardputer.Display.fillTriangle(x + 14, y + 2, x + 8, y + 5, x + 14, y + 5, TFT_WHITE);
         // Bottom triangle
@@ -157,9 +182,9 @@ void drawBattery() {
     // Draw Percentage Text
     M5Cardputer.Display.setFont(&fonts::Font0);
     M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
-    M5Cardputer.Display.setCursor(x - 25, y + 1); // Adjusted position slightly left
+    M5Cardputer.Display.setCursor(x - 25, y + 1); 
     
-    if (batLevel == 100) M5Cardputer.Display.setCursor(x - 29, y + 1); // Shift for 3 digits
+    if (batLevel == 100) M5Cardputer.Display.setCursor(x - 29, y + 1); 
     
     M5Cardputer.Display.print(batLevel);
     M5Cardputer.Display.print("%");
@@ -263,6 +288,28 @@ static constexpr size_t WAVE_SIZE = 320;
 static fft_t fft;
 static int16_t raw_data[WAVE_SIZE * 2];
 
+
+
+// Helper function to read a single song path from the SD card using its offset
+String getSongPath(int index) {
+    if (index < 0 || index >= songOffsets.size()) return "";
+    File f = SD.open(PLAYLIST_FILE);
+    if (!f) return "";
+    f.seek(songOffsets[index]);            
+    String path = f.readStringUntil('\n'); 
+    f.close();
+
+    // Aggressively clean the string
+    path.trim(); 
+    
+    // The SD library demands paths start with a forward slash
+    if (path.length() > 0 && !path.startsWith("/")) {
+        path = "/" + path;
+    }
+    
+    return path;
+}
+
 // --- FILESYSTEM ---
 void savePlaylist() {
   if(SD.exists(PLAYLIST_FILE)) SD.remove(PLAYLIST_FILE);
@@ -272,23 +319,32 @@ void savePlaylist() {
   file.close();
 }
 
+// Builds the RAM index of file offsets so we can seek() quickly later
 bool loadPlaylist() {
-  if (!SD.exists(PLAYLIST_FILE)) return false;
-  File file = SD.open(PLAYLIST_FILE);
-  if (!file) return false;
-  songList.clear();
-  while (file.available()) {
-      String line = file.readStringUntil('\n');
-      line.trim();
-      if (line.length() > 0 && (line.endsWith(".mp3") || line.endsWith(".MP3"))) {
-          songList.push_back(line);
-      }
-  }
-  file.close();
-  return (songList.size() > 0);
+    songOffsets.clear();
+    if (!SD.exists(PLAYLIST_FILE)) return false;
+    File file = SD.open(PLAYLIST_FILE);
+    if (!file) return false;
+
+    while (file.available()) {
+        // 1. Grab the offset BEFORE we read the line
+        uint32_t pos = file.position(); 
+        
+        // 2. Read the line
+        String line = file.readStringUntil('\n');
+        line.trim(); // Clean up hidden carriage returns
+        
+        // 3. ONLY save the offset if it's an actual audio file
+        if (line.length() > 0 && (line.endsWith(".mp3") || line.endsWith(".MP3"))) {
+            songOffsets.push_back(pos);
+        }
+    }
+    file.close();
+    return (songOffsets.size() > 0);
 }
 
-void listDir(fs::FS &fs, const char *dirname, uint8_t levels) {
+// Pass the open File object so it can write directly without using RAM
+void listDir(fs::FS &fs, const char *dirname, uint8_t levels, File &playlistFile) {
     if(stop_scan) return;
     File root = fs.open(dirname);
     if (!root || !root.isDirectory()) return;
@@ -297,12 +353,14 @@ void listDir(fs::FS &fs, const char *dirname, uint8_t levels) {
     while (file) {
         if(stop_scan) return;
         if (file.isDirectory()) {
-            if (levels) listDir(fs, file.path(), levels - 1);
+            if (levels) listDir(fs, file.path(), levels - 1, playlistFile);
         } else {
             String filename = file.name();
             String filepath = file.path();
             if (filename.endsWith(".mp3") || filename.endsWith(".MP3")) {
-                songList.push_back(filepath);
+                playlistFile.println(filepath); // Write directly to SD
+                
+                // Keep the UI updated
                 M5Cardputer.Display.fillScreen(C_BG_DARK);
                 M5Cardputer.Display.setCursor(10, 40);
                 M5Cardputer.Display.println("Scanning...");
@@ -317,20 +375,30 @@ void listDir(fs::FS &fs, const char *dirname, uint8_t levels) {
 
 void performFullScan() {
     stop_scan = false;
-    songList.clear();
+    songOffsets.clear();
     M5Cardputer.Display.fillScreen(C_BG_DARK);
     M5Cardputer.Display.setCursor(10, 40);
     M5Cardputer.Display.println("Scanning SD Card...");
-    listDir(SD, "/", 3);
-    savePlaylist();
+    
+    // Clear old playlist and open for writing
+    if (SD.exists(PLAYLIST_FILE)) SD.remove(PLAYLIST_FILE);
+    File playlistFile = SD.open(PLAYLIST_FILE, FILE_WRITE);
+    
+    // Scan and write
+    if (playlistFile) {
+        listDir(SD, "/", 3, playlistFile);
+        playlistFile.close();
+    }
+    
+    // Build the offset index from the newly created file
+    loadPlaylist(); 
 }
 
 // --- DRAWING FUNCTIONS ---
 void drawPlaylist() {
   M5Cardputer.Display.setFont(&fonts::Font0);
-  int totalSongs = songList.size();
+  int totalSongs = songOffsets.size();
   
-  // CENTER LOCK SCROLLING
   int halfPage = MAX_VISIBLE_ROWS / 2;
   int startIdx = browserIndex - halfPage;
   if (startIdx < 0) startIdx = 0;
@@ -340,15 +408,19 @@ void drawPlaylist() {
   int yPos = HEADER_HEIGHT + 2;
   int xPos = 0;
   
-  // Clear Sidebar (Using updated Width)
   M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, PLAYLIST_WIDTH, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_LIGHT);
   M5Cardputer.Display.drawFastVLine(PLAYLIST_WIDTH, HEADER_HEIGHT, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_DARK);
+
+  // OPEN FILE AND JUMP TO THE FIRST VISIBLE ROW
+  File f = SD.open(PLAYLIST_FILE);
+  if (f && totalSongs > 0) {
+      f.seek(songOffsets[startIdx]);
+  }
 
   for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
     int actualIdx = startIdx + i;
     if (actualIdx >= totalSongs) break;
 
-    // Highlight
     if (actualIdx == browserIndex) {
       M5Cardputer.Display.fillRect(xPos + 2, yPos, PLAYLIST_WIDTH - 6, ROW_HEIGHT, C_ACCENT); 
       M5Cardputer.Display.setTextColor(C_BG_DARK);
@@ -359,15 +431,22 @@ void drawPlaylist() {
       M5Cardputer.Display.setTextColor(C_TEXT_DIM);
     }
 
-    String dispName = songList[actualIdx];
+    // READ NEXT LINE FROM SD CARD
+    String dispName = "";
+    if (f) {
+        dispName = f.readStringUntil('\n');
+        dispName.trim();
+    }
+    
     int slashIdx = dispName.lastIndexOf('/');
     if(slashIdx >= 0) dispName = dispName.substring(slashIdx+1);
 
     M5Cardputer.Display.setCursor(xPos + 5, yPos + 3);
     if (actualIdx == currentFileIndex) M5Cardputer.Display.print("> ");
-    M5Cardputer.Display.print(dispName.substring(0, 16)); // Increased char limit due to wider list
+    M5Cardputer.Display.print(dispName.substring(0, 16)); 
     yPos += ROW_HEIGHT;
   }
+  if (f) f.close();
 }
 
 void drawBottomBar() {
@@ -540,40 +619,60 @@ void drawHelpPopup() {
         M5Cardputer.Display.print(helpLines[idx]);
     }
 }
-
 void drawSettingsMenu() {
-    int px = 20; int py = 20; int pw = 200; int ph = 120;
+    int px = 20; int py = 15; int pw = 200; int ph = 135;
     M5Cardputer.Display.fillRoundRect(px, py, pw, ph, 4, C_BG_LIGHT);
     M5Cardputer.Display.drawRoundRect(px, py, pw, ph, 4, C_ACCENT);
+    
+    // Header
     M5Cardputer.Display.setFont(&fonts::Font0);
     M5Cardputer.Display.fillRoundRect(px+2, py+2, pw-4, 18, 2, C_HEADER);
     M5Cardputer.Display.setCursor(px + 8, py + 5);
     M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
     M5Cardputer.Display.print("SETTINGS");
 
+    String totalText = String(songOffsets.size()) + " Songs";
+    int textWidth = M5Cardputer.Display.textWidth(totalText.c_str());
+    M5Cardputer.Display.setCursor(px + pw - textWidth - 8, py + 5);
+    M5Cardputer.Display.print(totalText);
+
     int startY = py + 30;
     int gap = 20;
 
-    M5Cardputer.Display.setCursor(px + 15, startY);
-    if (settingsCursor == 0) M5Cardputer.Display.setTextColor(C_HIGHLIGHT);
-    else M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.printf("Brightness: %d", userSettings.brightness);
+    // --- NEW: Draw only the visible rows ---
+    for (int i = 0; i < MAX_MENU_ROWS; i++) {
+        int idx = menuScrollOffset + i;
+        if (idx >= TOTAL_SETTINGS) break;
 
-    M5Cardputer.Display.setCursor(px + 15, startY + gap);
-    if (settingsCursor == 1) M5Cardputer.Display.setTextColor(C_HIGHLIGHT);
-    else M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.printf("Screen Off: %s", timeoutLabels[userSettings.timeoutIndex]);
+        M5Cardputer.Display.setCursor(px + 15, startY + (i * gap));
+        
+        // Highlight logic
+        if (idx == settingsCursor) {
+            M5Cardputer.Display.setTextColor(idx == 4 ? TFT_RED : C_HIGHLIGHT); 
+        } else {
+            M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+        }
 
-    M5Cardputer.Display.setCursor(px + 15, startY + (gap * 2));
-    if (settingsCursor == 2) M5Cardputer.Display.setTextColor(C_HIGHLIGHT);
-    else M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.printf("Resume Play: %s", userSettings.resumePlay ? "ON" : "OFF");
+        // Content logic
+        switch (idx) {
+            case 0: M5Cardputer.Display.printf("Brightness: %d", userSettings.brightness); break;
+            case 1: M5Cardputer.Display.printf("Screen Off: %s", timeoutLabels[userSettings.timeoutIndex]); break;
+            case 2: M5Cardputer.Display.printf("Resume Play: %s", userSettings.resumePlay ? "ON" : "OFF"); break;
+            case 3: M5Cardputer.Display.printf("DAC Rate: %s", sampleRateLabels[userSettings.spkRateIndex]); break;
+            case 4: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;
+        }
+    }
 
-    M5Cardputer.Display.setCursor(px + 15, startY + (gap * 3));
-    if (settingsCursor == 3) M5Cardputer.Display.setTextColor(TFT_RED); 
-    else M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.print("[ RESCAN LIBRARY ]");
+    // --- NEW: Draw Scroll Indicators ---
+    M5Cardputer.Display.setTextColor(C_ACCENT);
+    if (menuScrollOffset > 0) {
+        M5Cardputer.Display.drawString("^", px + pw - 15, startY);
+    }
+    if (menuScrollOffset + MAX_MENU_ROWS < TOTAL_SETTINGS) {
+        M5Cardputer.Display.drawString("v", px + pw - 15, startY + ((MAX_MENU_ROWS - 1) * gap));
+    }
 
+    // Footer
     M5Cardputer.Display.setCursor(px + 15, py + ph - 15);
     M5Cardputer.Display.setTextColor(C_TEXT_DIM);
     M5Cardputer.Display.print("Press 'M' to Exit");
@@ -581,7 +680,7 @@ void drawSettingsMenu() {
 
 void redrawUI() {
     M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, M5Cardputer.Display.width(), M5Cardputer.Display.height() - HEADER_HEIGHT, C_BG_DARK);
-    drawBattery();
+    drawHeader();
     drawPlaylist();
     drawNowPlayingInfo();
     drawBottomBar();
@@ -594,26 +693,38 @@ void stop_audio() {
   if (file) { file->close(); delete file; file = nullptr; }
 }
 
-void play_current() {
+void play_current(uint32_t startPos = 0) { // <-- NEW: Takes an optional starting position
   stop_audio();
-  if (songList.empty()) return;
+  if (songOffsets.empty()) return;
 
   currentTitle = ""; currentArtist = "";
   browserIndex = currentFileIndex; 
   
   M5Cardputer.Display.fillScreen(C_BG_DARK);
-  M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
-  M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-  M5Cardputer.Display.drawString("Music Player", 10, 2);
-
-  drawBattery();
+  drawHeader();
   drawPlaylist();
   drawBottomBar();
 
-  String fname = songList[currentFileIndex];
+  String fname = getSongPath(currentFileIndex);
+  
+  if (!SD.exists(fname)) {
+      M5Cardputer.Display.setTextColor(TFT_RED);
+      M5Cardputer.Display.setCursor(PLAYLIST_WIDTH + 10, HEADER_HEIGHT + 20);
+      M5Cardputer.Display.print("FILE ERROR:");
+      M5Cardputer.Display.setCursor(PLAYLIST_WIDTH + 10, HEADER_HEIGHT + 35);
+      M5Cardputer.Display.print(fname); 
+      return; 
+  }
+
   file = new AudioFileSourceSD(fname.c_str());
   id3 = new AudioFileSourceID3(file);
   id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
+  
+  // --- NEW: Seek the file BEFORE turning on the MP3 decoder ---
+  if (startPos > 0) {
+      id3->seek(startPos, 1);
+  }
+  
   mp3 = new AudioGeneratorMP3();
   mp3->begin(id3, out);
   isPaused = false;
@@ -630,13 +741,32 @@ void pause_audio() {
 }
 
 void resume_audio() {
-  if (!isPaused || songList.empty()) return;
+  if (!isPaused || songOffsets.empty()) return;
   stop_audio();
-  String fname = songList[currentFileIndex];
+
+  // 1. Get the path using our new SD reader function
+  String fname = getSongPath(currentFileIndex);
+  
+  // 2. Safety check (prevents silent crashes!)
+  if (!SD.exists(fname)) {
+      M5Cardputer.Display.setTextColor(TFT_RED);
+      M5Cardputer.Display.setCursor(PLAYLIST_WIDTH + 10, HEADER_HEIGHT + 20);
+      M5Cardputer.Display.print("RESUME ERR:");
+      M5Cardputer.Display.setCursor(PLAYLIST_WIDTH + 10, HEADER_HEIGHT + 35);
+      M5Cardputer.Display.print(fname);
+      return; 
+  }
+
+  // 3. Restart the audio stream
   file = new AudioFileSourceSD(fname.c_str());
   id3 = new AudioFileSourceID3(file);
   id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
-  id3->seek(paused_at, 1);
+  
+  // Jump back to where we paused
+  if (paused_at > 0) {
+      id3->seek(paused_at, 1);
+  }
+  
   mp3 = new AudioGeneratorMP3();
   mp3->begin(id3, out);
   isPaused = false;
@@ -644,17 +774,29 @@ void resume_audio() {
 }
 
 void next_song(bool autoPlay = false) {
-    if (songList.empty()) return;
-    if (autoPlay && loopMode == LOOP_ONE) { play_current(); return; }
+    // 1. Safety check uses our new offset list
+    if (songOffsets.empty()) return;
+
+    if (autoPlay && loopMode == LOOP_ONE) { 
+        play_current(); 
+        return; 
+    }
+
     if (isShuffle) {
-        currentFileIndex = random(0, songList.size());
+        // 2. Random selection uses new size
+        currentFileIndex = random(0, songOffsets.size());
     } else {
         currentFileIndex++;
-        if (currentFileIndex >= songList.size()) {
-            if (loopMode == LOOP_ALL) currentFileIndex = 0;
-            else {
-                stop_audio(); currentFileIndex = 0;
-                M5Cardputer.Display.fillScreen(C_BG_DARK); drawPlaylist(); drawBottomBar();
+        // 3. Bounds checking uses new size
+        if (currentFileIndex >= songOffsets.size()) {
+            if (loopMode == LOOP_ALL) {
+                currentFileIndex = 0;
+            } else {
+                stop_audio(); 
+                currentFileIndex = 0;
+                M5Cardputer.Display.fillScreen(C_BG_DARK); 
+                drawPlaylist(); 
+                drawBottomBar();
                 return;
             }
         }
@@ -663,12 +805,17 @@ void next_song(bool autoPlay = false) {
 }
 
 void prev_song() {
-    if (songList.empty()) return;
+    // 1. Safety check
+    if (songOffsets.empty()) return;
+
     if (isShuffle) {
-        currentFileIndex = random(0, songList.size());
+        currentFileIndex = random(0, songOffsets.size());
     } else {
         currentFileIndex--;
-        if (currentFileIndex < 0) currentFileIndex = songList.size() - 1;
+        // 2. Loop-around check uses new size
+        if (currentFileIndex < 0) {
+            currentFileIndex = songOffsets.size() - 1;
+        }
     }
     play_current();
 }
@@ -683,7 +830,7 @@ void seek_audio(int seconds) {
     if (newPos > fileSize) newPos = fileSize - 1000;
 
     stop_audio();
-    String fname = songList[currentFileIndex];
+    String fname = getSongPath(currentFileIndex);
     file = new AudioFileSourceSD(fname.c_str());
     id3 = new AudioFileSourceID3(file);
     id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
@@ -697,7 +844,7 @@ void setup() {
   auto cfg = M5.config();
   cfg.external_speaker.hat_spk = true;
   M5Cardputer.begin(cfg);
-
+  M5Cardputer.Power.setBatteryCharge(true);
   auto spk_cfg = M5Cardputer.Speaker.config();
   spk_cfg.sample_rate = 128000;
   spk_cfg.task_pinned_core = APP_CPU_NUM;
@@ -722,7 +869,9 @@ void setup() {
 
   loadConfig();
   M5Cardputer.Display.setBrightness(userSettings.brightness);
-
+  auto spk_cfg_updated = M5Cardputer.Speaker.config();
+  spk_cfg_updated.sample_rate = sampleRateValues[userSettings.spkRateIndex];
+  M5Cardputer.Speaker.config(spk_cfg_updated);
   M5Cardputer.Display.fillScreen(C_BG_DARK);
   M5Cardputer.Display.setCursor(10, 40);
   M5Cardputer.Display.setTextColor(C_ACCENT);
@@ -731,16 +880,13 @@ void setup() {
   if (!loadPlaylist()) performFullScan();
   else { M5Cardputer.Display.println("Loaded!"); delay(200); }
 
-  if (songList.size() > 0) {
-      if (userSettings.resumePlay && userSettings.lastIndex < songList.size()) {
+// --- NEW: Cleaned up startup logic ---
+  if (songOffsets.size() > 0) {
+      if (userSettings.resumePlay && userSettings.lastIndex < songOffsets.size()) {
           currentFileIndex = userSettings.lastIndex;
-          browserIndex = currentFileIndex; 
-          paused_at = userSettings.lastPos;
-          play_current(); 
-          if (mp3 && id3 && paused_at > 0) {
-              delay(100); 
-              id3->seek(paused_at, 1);
-          }
+          // Pass the saved position directly into the play function
+          play_current(userSettings.lastPos); 
+          
       } else {
           currentFileIndex = 0;
           browserIndex = 0;
@@ -754,7 +900,7 @@ void setup() {
   }
   
   lastInputTime = millis();
-} 
+}
 
 // --- LOOP ---
 void loop() {
@@ -768,10 +914,10 @@ void loop() {
     if (clicks > 0) {
         if (clicks == 1) {
             // 1 Click: Play / Pause
-            if (songList.size() > 0) {
+            if (songOffsets.size() > 0) { // <--- MUST BE songOffsets
                 if (isPaused) resume_audio(); 
                 else pause_audio();
-                saveConfig(); // Save state
+                saveConfig(); 
             }
         } 
         else if (clicks == 2) {
@@ -827,12 +973,29 @@ void loop() {
           bool needRedraw = false;
           if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
               settingsCursor--; 
-              if (settingsCursor < 0) settingsCursor = 3;
+              if (settingsCursor < 0) {
+                  // Wrap to bottom
+                  settingsCursor = TOTAL_SETTINGS - 1;
+                  menuScrollOffset = TOTAL_SETTINGS - MAX_MENU_ROWS;
+                  if (menuScrollOffset < 0) menuScrollOffset = 0;
+              } else if (settingsCursor < menuScrollOffset) {
+                  // Scroll up
+                  menuScrollOffset = settingsCursor;
+              }
               needRedraw = true;
           }
+          
+          // DOWN KEY
           if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
               settingsCursor++; 
-              if (settingsCursor > 3) settingsCursor = 0;
+              if (settingsCursor >= TOTAL_SETTINGS) {
+                  // Wrap to top
+                  settingsCursor = 0;
+                  menuScrollOffset = 0;
+              } else if (settingsCursor >= menuScrollOffset + MAX_MENU_ROWS) {
+                  // Scroll down
+                  menuScrollOffset = settingsCursor - MAX_MENU_ROWS + 1;
+              }
               needRedraw = true;
           }
           if (M5Cardputer.Keyboard.isKeyPressed(',') || M5Cardputer.Keyboard.isKeyPressed('/') || M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
@@ -849,7 +1012,17 @@ void loop() {
                   if (userSettings.timeoutIndex < 0) userSettings.timeoutIndex = 4;
               } else if (settingsCursor == 2) { // Resume
                   userSettings.resumePlay = !userSettings.resumePlay;
-              } else if (settingsCursor == 3) { // Rescan
+              } else if (settingsCursor == 3) { 
+                  // --- HARDWARE SAMPLE RATE SELECTION ---
+                  userSettings.spkRateIndex += (isRight ? 1 : -1);
+                  if (userSettings.spkRateIndex > 4) userSettings.spkRateIndex = 0;
+                  if (userSettings.spkRateIndex < 0) userSettings.spkRateIndex = 4;
+                  
+                  // Apply immediately to the hardware!
+                  auto spk_cfg = M5Cardputer.Speaker.config();
+                  spk_cfg.sample_rate = sampleRateValues[userSettings.spkRateIndex];
+                  M5Cardputer.Speaker.config(spk_cfg);
+              } else if (settingsCursor == 4) { // Rescan
                   stop_audio();
                   performFullScan(); 
                   showSettingsMenu = false; 
@@ -906,12 +1079,14 @@ void loop() {
       bool listChanged = false;
       if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
           browserIndex--;
-          if (browserIndex < 0) browserIndex = songList.size() - 1;
+          // Make sure this uses songOffsets!
+          if (browserIndex < 0) browserIndex = songOffsets.size() - 1; 
           listChanged = true;
       }
       if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
           browserIndex++;
-          if (browserIndex >= songList.size()) browserIndex = 0;
+          // Make sure this uses songOffsets!
+          if (browserIndex >= songOffsets.size()) browserIndex = 0; 
           listChanged = true;
       }
       if (listChanged) {
