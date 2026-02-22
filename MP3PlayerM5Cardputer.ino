@@ -14,9 +14,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
-// --- WIFI & WEB SERVER ---
-// const char* ssid = "YOUR_WIFI_SSID";         // Change this
-// const char* password = "YOUR_WIFI_PASSWORD"; // Change this
+// --- WEB SERVER ---
 WebServer server(80);
 // --- AESTHETIC COLORS ---
 #define C_BG_DARK     0x1002  // Gunmetal
@@ -204,7 +202,7 @@ void handleRoot() {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>M5Cardputer Streamer</title>
+        <title>Sam Music Player</title>
         <style>
             :root {
                 --bg-dark: #15181C;
@@ -244,7 +242,7 @@ void handleRoot() {
         </style>
     </head>
     <body>
-        <h1>CARDPUTER NAS</h1>
+        <h1>SAM MUSIC PLAYER</h1>
         
         <div class="player-card">
             <div id="now-playing">Select a song to start</div>
@@ -953,11 +951,11 @@ const std::vector<String> helpLines = {
   "N / B : Next / Prev Song",
   "/ / , : Seek +5s / -5s",
   "S: Shuffle   L: Loop Mode", 
-  "M: Settings  V: Visualizer",
+  "Esc: Settings  V: Visualizer",
   "I: Close Help",
   "--- SMART FEATURES ---",
   "Web UI: Enable Wi-Fi in",
-  "settings to access WebUI.",
+  "settings to access .",
   "Power Saver: Underclock",
   "CPU to save battery life.",
   "--- POCKET MODE ---",
@@ -1054,7 +1052,7 @@ void drawSettingsMenu() {
     // Footer
     M5Cardputer.Display.setCursor(px + 15, py + ph - 15);
     M5Cardputer.Display.setTextColor(C_TEXT_DIM);
-    M5Cardputer.Display.print("Press 'M' to Exit");
+    M5Cardputer.Display.print("Press 'Esc' to Exit");
 }
 
 void redrawUI() {
@@ -1407,14 +1405,14 @@ void loop() {
       if(userSettings.resumePlay) saveConfig();
     }
     static unsigned long lastVisTime = 0;
-    if (!showHelpPopup && !showSettingsMenu && showVisualizer && !isScreenOff) {
+    if (!showHelpPopup && !showSettingsMenu && showVisualizer && !isScreenOff && !showTextInput) {
         if (millis() - lastVisTime > visRefreshTime) { 
             drawVisualizer();
             lastVisTime = millis();
         }
     }
     static unsigned long lastProgTime = 0;
-    if (!showHelpPopup && !showSettingsMenu && !isScreenOff) {
+    if (!showHelpPopup && !showSettingsMenu && !isScreenOff && showTextInput) {
         if (millis() - lastProgTime > 500) { 
             drawProgressBar();
             lastProgTime = millis();
@@ -1441,7 +1439,6 @@ void loop() {
         if (showTextInput) {
             auto status = M5Cardputer.Keyboard.keysState();
             bool redraw = false;
-            
             if (status.del && enteredText.length() > 0) {
                 enteredText.remove(enteredText.length() - 1);
                 redraw = true;
@@ -1476,7 +1473,7 @@ void loop() {
                         ESP.restart(); 
                     }
                 }
-            } else if (M5Cardputer.Keyboard.isKeyPressed('m') || M5Cardputer.Keyboard.isKeyPressed('`')) {
+            } else if (M5Cardputer.Keyboard.isKeyPressed('`')) {
                 showTextInput = false;
                 showSettingsMenu = true;
                 drawSettingsMenu();
@@ -1513,7 +1510,7 @@ void loop() {
               textInputTarget = 0; // Target: Client Password
               drawTextInput();
           }
-          if (M5Cardputer.Keyboard.isKeyPressed('m')) {
+          if (M5Cardputer.Keyboard.isKeyPressed('`')) {
               showWifiScanner = false;
               showSettingsMenu = true;
               drawSettingsMenu();
@@ -1651,7 +1648,7 @@ void loop() {
               }
           }
           
-          if (M5Cardputer.Keyboard.isKeyPressed('m')) {
+          if (M5Cardputer.Keyboard.isKeyPressed('`')) {
               showSettingsMenu = false;
               saveConfig();
               redrawUI();
@@ -1683,7 +1680,7 @@ void loop() {
       }
 
       // --- MAIN CONTROLS ---
-      if (M5Cardputer.Keyboard.isKeyPressed('m')) {
+      if (M5Cardputer.Keyboard.isKeyPressed('`')) {
           showSettingsMenu = true;
           drawSettingsMenu();
           return;
