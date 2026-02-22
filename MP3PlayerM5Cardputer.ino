@@ -15,8 +15,8 @@
 #include <WebServer.h>
 
 // --- WIFI & WEB SERVER ---
-const char* ssid = "YOUR_WIFI_SSID";         // Change this
-const char* password = "YOUR_WIFI_PASSWORD"; // Change this
+// const char* ssid = "YOUR_WIFI_SSID";         // Change this
+// const char* password = "YOUR_WIFI_PASSWORD"; // Change this
 WebServer server(80);
 // --- AESTHETIC COLORS ---
 #define C_BG_DARK     0x1002  // Gunmetal
@@ -48,8 +48,6 @@ WebServer server(80);
 // --- GLOBALS ---
 
 enum LoopState { NO_LOOP, LOOP_ALL, LOOP_ONE };
-std::vector<String> songList;
-
 int currentFileIndex = 0;   // Playing song
 int browserIndex = 0;       // Menu Selection
 
@@ -61,6 +59,7 @@ String currentTitle = "";
 String currentArtist = "";
 
 unsigned long lastBatteryUpdate = 0; 
+unsigned long visRefreshTime = 1; // refresh time for visualizer 
 const unsigned long BATTERY_UPDATE_INTERVAL = 10000; 
 bool showHelpPopup = false;
 bool showMenuPopup = false;
@@ -91,22 +90,27 @@ struct Settings {
     bool wifiEnabled = false;  // NEW: Toggle Wi-Fi Power
     String wifiSSID = "";      // NEW: Saved Network Name
     String wifiPass = "";      // NEW: Saved Password
+    bool isAPMode = false;
+    String apSSID = "Cardputer";   // NEW: Default AP Name
+    String apPass = "12345678";    // NEW: Default AP Password
+    int powerSaverMode = 0;        // NEW: 0=OFF, 1=BASIC(160MHz), 2=ULTRA(80MHz)
 };
 Settings userSettings;
 bool showSettingsMenu = false;
 int settingsCursor = 0; 
-const int TOTAL_SETTINGS = 7;      // Total number of items in the menu
+const int TOTAL_SETTINGS = 10;      // Total number of items in the menu
 const int MAX_MENU_ROWS = 4;       // How many items fit on the screen at once
 int menuScrollOffset = 0;          // Tracks which item is at the top of the menu
 
 // --- WIFI UI GLOBALS ---
 bool showWifiScanner = false;
-bool showPasswordInput = false;
 int wifiCursor = 0;
 int wifiScrollOffset = 0;
 int wifiNetworkCount = 0;
-String enteredPassword = "";
-
+// String enteredPassword = "";
+bool showTextInput = false;
+int textInputTarget = 0; // 0 = STA Pass, 1 = AP Name, 2 = AP Pass
+String enteredText = "";
 
 // --- GLOBALS ---
 std::vector<uint32_t> songOffsets; // Stores file byte positions instead of Strings
@@ -136,6 +140,10 @@ void saveConfig() {
         file.println(userSettings.wifiEnabled ? 1 : 0);
         file.println(userSettings.wifiSSID);
         file.println(userSettings.wifiPass);
+        file.println(userSettings.isAPMode ? 1 : 0);
+        file.println(userSettings.apSSID);
+        file.println(userSettings.apPass);
+        file.println(userSettings.powerSaverMode);
         file.close();
     }
 }
@@ -147,57 +155,216 @@ void loadConfig() {
         if(file.available()) userSettings.brightness = file.readStringUntil('\n').toInt();
         if(file.available()) userSettings.timeoutIndex = file.readStringUntil('\n').toInt();
         if(file.available()) userSettings.resumePlay = (file.readStringUntil('\n').toInt() == 1);
-        if(file.available()) userSettings.spkRateIndex = (file.readStringUntil('\n').toInt());
+        if(file.available()) userSettings.spkRateIndex = file.readStringUntil('\n').toInt();
         if(file.available()) userSettings.lastIndex = file.readStringUntil('\n').toInt();
         if(file.available()) userSettings.lastPos = file.readStringUntil('\n').toInt();
         if(file.available()) userSettings.wifiEnabled = (file.readStringUntil('\n').toInt() == 1);
         if(file.available()) { userSettings.wifiSSID = file.readStringUntil('\n'); userSettings.wifiSSID.trim(); }
         if(file.available()) { userSettings.wifiPass = file.readStringUntil('\n'); userSettings.wifiPass.trim(); }
+        if(file.available()) userSettings.isAPMode = (file.readStringUntil('\n').toInt() == 1);
+        if(file.available()) { userSettings.apSSID = file.readStringUntil('\n'); userSettings.apSSID.trim(); }
+        if(file.available()) { userSettings.apPass = file.readStringUntil('\n'); userSettings.apPass.trim(); }
+        if(file.available()) userSettings.powerSaverMode = file.readStringUntil('\n').toInt();
+
+        // Failsafe defaults if the text gets wiped
+        if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
+        if(userSettings.apPass.length() < 8) userSettings.apPass = "12345678";
         if (userSettings.brightness < 5) userSettings.brightness = 5;
         if (userSettings.brightness > 255) userSettings.brightness = 255;
         if (userSettings.timeoutIndex < 0 || userSettings.timeoutIndex > 4) userSettings.timeoutIndex = 0;
         file.close();
+        applyCpuFrequency();
     }
 }
 
 // --- WEB SERVER FUNCTIONS ---
+void applyCpuFrequency() {
+    // Wi-Fi requires high clock speeds to remain stable
+    if (userSettings.wifiEnabled) {
+        setCpuFrequencyMhz(240); 
+    } else {
+        if (userSettings.powerSaverMode == 2) {
+            setCpuFrequencyMhz(80);  // ULTRA
+            visRefreshTime = 100;
+        } else if (userSettings.powerSaverMode == 1) {
+            setCpuFrequencyMhz(160); // BASIC
+            visRefreshTime = 30;
+        } else {
+            setCpuFrequencyMhz(240); // OFF
+            visRefreshTime = 20 ;
+        }
+    }
+}
 
 // 1. The HTML Web UI
 void handleRoot() {
-    // We use a raw string literal to embed the HTML cleanly
     String html = R"rawliteral(
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Cardputer Audio NAS</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>M5Cardputer Streamer</title>
         <style>
-            body { font-family: sans-serif; background-color: #101214; color: #ffffff; padding: 20px; max-width: 600px; margin: 0 auto; }
-            h1 { color: #05BF; }
-            audio { width: 100%; margin-bottom: 20px; outline: none; }
-            ul { list-style: none; padding: 0; }
-            li { background: #212429; margin-bottom: 5px; padding: 12px; border-radius: 4px; cursor: pointer; transition: 0.2s; }
-            li:hover { background: #05BF; color: #101214; }
+            :root {
+                --bg-dark: #15181C;
+                --bg-light: #252830;
+                --slate-blue: #4A5B82;
+                --cyan: #00E5FF;
+                --green: #00FF66;
+                --magenta: #FF007F;
+            }
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: var(--bg-dark); color: #ffffff; padding: 20px; max-width: 650px; margin: 0 auto; }
+            h1 { color: var(--cyan); text-align: center; font-weight: 300; letter-spacing: 2px; }
+            
+            /* Sticky Player Header */
+            .player-card { background: var(--bg-light); padding: 20px; border-radius: 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.6); text-align: center; position: sticky; top: 10px; z-index: 100; border: 1px solid #333;}
+            #now-playing { font-size: 1.2em; margin-bottom: 15px; color: var(--green); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: bold;}
+            audio { width: 100%; margin-bottom: 15px; outline: none; border-radius: 5px; height: 40px; }
+            
+            /* Transport Controls */
+            .controls { display: flex; justify-content: center; gap: 12px; margin-bottom: 5px; }
+            button { background: var(--slate-blue); color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-size: 16px; transition: all 0.2s; }
+            button:hover { background: var(--cyan); color: var(--bg-dark); transform: scale(1.05); }
+            button.active { background: var(--magenta); color: white; }
+            
+            /* Playlist */
+            ul { list-style: none; padding: 0; margin-top: 25px;}
+            li { display: flex; justify-content: space-between; align-items: center; background: var(--bg-light); margin-bottom: 8px; border-radius: 6px; transition: 0.2s; border-left: 4px solid transparent; }
+            li:hover { background: var(--slate-blue); }
+            li.playing { background: #1A2933; border-left: 4px solid var(--cyan); color: var(--cyan); font-weight: bold; }
+            
+            .song-info { flex-grow: 1; padding: 14px; cursor: pointer; display: flex; align-items: center; }
+            .track-num { color: #888; margin-right: 15px; font-size: 0.85em; width: 25px; text-align: right; }
+            li.playing .track-num { color: var(--cyan); }
+            
+            /* Download Button */
+            .dl-btn { background: #333; color: white; text-decoration: none; padding: 8px 12px; border-radius: 4px; margin-right: 10px; font-size: 1.1em; transition: 0.2s; }
+            .dl-btn:hover { background: var(--magenta); transform: scale(1.1); }
         </style>
     </head>
     <body>
-        <h1>M5Cardputer Streamer</h1>
-        <audio id="player" controls autoplay></audio>
-        <ul id="playlist"><li>Loading library...</li></ul>
+        <h1>CARDPUTER NAS</h1>
+        
+        <div class="player-card">
+            <div id="now-playing">Select a song to start</div>
+            <audio id="player" controls></audio>
+            <div class="controls">
+                <button id="btnPrev" title="Previous Song">⏮</button>
+                <button id="btnNext" title="Next Song">⏭</button>
+                <button id="btnShuffle" title="Toggle Shuffle">🔀</button>
+                <button id="btnLoop" title="Toggle Loop Mode">🔁</button>
+            </div>
+        </div>
+
+        <ul id="playlist"><li>Loading library from SD...</li></ul>
+
         <script>
+            let songs = [];
+            let currentIndex = -1;
+            let isShuffle = false;
+            let loopMode = 0; // 0: All, 1: One
+            
+            const player = document.getElementById('player');
+            const btnPrev = document.getElementById('btnPrev');
+            const btnNext = document.getElementById('btnNext');
+            const btnShuffle = document.getElementById('btnShuffle');
+            const btnLoop = document.getElementById('btnLoop');
+            const nowPlaying = document.getElementById('now-playing');
+            const playlistEl = document.getElementById('playlist');
+
+            // Fetch Library
             fetch('/api/songs').then(r => r.json()).then(data => {
-                const list = document.getElementById('playlist');
-                list.innerHTML = ''; // Clear loading text
-                data.forEach((song, idx) => {
+                songs = data;
+                playlistEl.innerHTML = '';
+                songs.forEach((song, idx) => {
                     let li = document.createElement('li');
-                    li.innerText = song;
-                    li.onclick = () => {
-                        document.getElementById('player').src = '/stream?id=' + idx;
-                        document.getElementById('player').play();
-                    };
-                    list.appendChild(li);
+                    li.id = 'song-' + idx;
+                    
+                    // Clickable area to play the song
+                    let infoDiv = document.createElement('div');
+                    infoDiv.className = 'song-info';
+                    infoDiv.innerHTML = `<span class="track-num">${idx + 1}</span> <span class="track-name">${song}</span>`;
+                    infoDiv.onclick = () => playSong(idx);
+                    
+                    // Direct Download Link
+                    let dlLink = document.createElement('a');
+                    dlLink.className = 'dl-btn';
+                    dlLink.href = '/download?id=' + idx;
+                    dlLink.title = 'Download MP3';
+                    dlLink.innerText = '💾';
+                    
+                    li.appendChild(infoDiv);
+                    li.appendChild(dlLink);
+                    playlistEl.appendChild(li);
                 });
+            }).catch(err => {
+                playlistEl.innerHTML = '<li style="color:red; padding:15px;">Error loading library. Ensure SD card is inserted.</li>';
             });
+
+            // Core Playback Logic
+            function playSong(index) {
+                if (index < 0 || index >= songs.length) return;
+                
+                if (currentIndex !== -1) {
+                    let oldLi = document.getElementById('song-' + currentIndex);
+                    if(oldLi) oldLi.classList.remove('playing');
+                }
+                
+                currentIndex = index;
+                
+                let newLi = document.getElementById('song-' + currentIndex);
+                if(newLi) {
+                    newLi.classList.add('playing');
+                    newLi.scrollIntoView({ behavior: 'smooth', block: 'center' }); 
+                }
+                
+                nowPlaying.innerText = songs[currentIndex];
+                player.src = '/stream?id=' + currentIndex;
+                player.play();
+            }
+
+            function playNext() {
+                if (songs.length === 0) return;
+                if (loopMode === 1) { 
+                    playSong(currentIndex);
+                    return;
+                }
+                if (isShuffle) {
+                    let randomIdx;
+                    do { randomIdx = Math.floor(Math.random() * songs.length); } 
+                    while (randomIdx === currentIndex && songs.length > 1);
+                    playSong(randomIdx);
+                } else {
+                    let nextIdx = (currentIndex + 1) % songs.length;
+                    playSong(nextIdx);
+                }
+            }
+
+            function playPrev() {
+                if (songs.length === 0) return;
+                if (currentIndex === -1) currentIndex = 0;
+                let prevIdx = (currentIndex - 1 + songs.length) % songs.length;
+                playSong(prevIdx);
+            }
+
+            // Button Listeners
+            btnNext.onclick = playNext;
+            btnPrev.onclick = playPrev;
+            
+            btnShuffle.onclick = () => {
+                isShuffle = !isShuffle;
+                btnShuffle.classList.toggle('active', isShuffle);
+            };
+            
+            btnLoop.onclick = () => {
+                loopMode = (loopMode + 1) % 2;
+                btnLoop.innerText = loopMode === 1 ? '🔂' : '🔁';
+                btnLoop.classList.toggle('active', loopMode === 1);
+            };
+
+            // Auto-advance
+            player.addEventListener('ended', playNext);
         </script>
     </body>
     </html>
@@ -205,6 +372,30 @@ void handleRoot() {
     server.send(200, "text/html", html);
 }
 
+void handleDownload() {
+    if (!server.hasArg("id")) {
+        server.send(400, "text/plain", "Missing song ID");
+        return;
+    }
+    
+    int id = server.arg("id").toInt();
+    String path = getSongPath(id);
+    File f = SD.open(path);
+    
+    if (!f) {
+        server.send(404, "text/plain", "File not found");
+        return;
+    }
+    
+    // Extract just the filename to give the downloaded file a proper name
+    int slashIdx = path.lastIndexOf('/');
+    String filename = (slashIdx >= 0) ? path.substring(slashIdx + 1) : path;
+    
+    // Tell the browser to download it as an attachment
+    server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+    server.streamFile(f, "audio/mpeg");
+    f.close();
+}
 // 2. Stream the Playlist as JSON without crashing RAM
 void handleSongList() {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -249,26 +440,27 @@ void handleStream() {
 }
 
 void drawHeader() {
-    // Fill the header background
     M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
     M5Cardputer.Display.setFont(&fonts::Font0); 
     
-    // 1. Check Wi-Fi status to determine the prefix
     String prefix = "Music Player";
-    if (WiFi.status() == WL_CONNECTED) {
-        prefix = WiFi.localIP().toString();
-        // Highlight the IP address in Cyan so it stands out
-        M5Cardputer.Display.setTextColor(C_ACCENT, C_HEADER);
+    if (userSettings.wifiEnabled) {
+        if (userSettings.isAPMode) {
+            prefix = WiFi.softAPIP().toString(); // Usually 192.168.4.1
+            M5Cardputer.Display.setTextColor(TFT_ORANGE, C_HEADER); // Orange for AP
+        } else if (WiFi.status() == WL_CONNECTED) {
+            prefix = WiFi.localIP().toString();
+            M5Cardputer.Display.setTextColor(C_ACCENT, C_HEADER);   // Cyan for Client
+        } else {
+            M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
+        }
     } else {
-        // Standard white text if offline
         M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
     }
     
-    // 2. Build and draw the final string
     String headerText = prefix + " [" + String(currentFileIndex + 1) + "/" + String(songOffsets.size()) + "]";
     M5Cardputer.Display.drawString(headerText.c_str(), 5, 5); 
     
-    // 3. Draw the battery on top of the right side
     drawBattery(); 
 }
 
@@ -306,26 +498,29 @@ void drawWifiScanner() {
     }
 }
 
-void drawPasswordInput() {
+void drawTextInput() {
     M5Cardputer.Display.fillScreen(C_BG_DARK);
     M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
     M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
     M5Cardputer.Display.setCursor(5, 5);
-    M5Cardputer.Display.print("Enter Password:");
-
-    M5Cardputer.Display.setTextColor(C_ACCENT);
-    M5Cardputer.Display.setCursor(10, HEADER_HEIGHT + 15);
-    M5Cardputer.Display.print(userSettings.wifiSSID);
+    
+    // Dynamic Header based on what we are typing
+    if (textInputTarget == 0) M5Cardputer.Display.print("Enter Client Password:");
+    else if (textInputTarget == 1) M5Cardputer.Display.print("Set AP Name (SSID):");
+    else if (textInputTarget == 2) M5Cardputer.Display.print("Set AP Password (8+ chars):");
 
     // Draw Input Box
     M5Cardputer.Display.drawRect(10, HEADER_HEIGHT + 35, M5Cardputer.Display.width() - 20, 25, C_TEXT_MAIN);
     M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
     M5Cardputer.Display.setCursor(15, HEADER_HEIGHT + 40);
     
-    // Mask password with asterisks for aesthetic
-    String masked = "";
-    for(int i=0; i<enteredPassword.length(); i++) masked += "*";
-    M5Cardputer.Display.print(enteredPassword + "_"); // Blink cursor
+    // Mask the password if it's for the client Wi-Fi, otherwise show text
+    String displayStr = enteredText;
+    if (textInputTarget == 0) { 
+        displayStr = "";
+        for(int i=0; i<enteredText.length(); i++) displayStr += "*";
+    }
+    M5Cardputer.Display.print(displayStr + "_"); // Blink cursor
 
     M5Cardputer.Display.setCursor(10, M5Cardputer.Display.height() - 20);
     M5Cardputer.Display.setTextColor(C_TEXT_DIM);
@@ -497,15 +692,6 @@ String getSongPath(int index) {
     return path;
 }
 
-// --- FILESYSTEM ---
-void savePlaylist() {
-  if(SD.exists(PLAYLIST_FILE)) SD.remove(PLAYLIST_FILE);
-  File file = SD.open(PLAYLIST_FILE, FILE_WRITE);
-  if (!file) return;
-  for (const auto& song : songList) file.println(song);
-  file.close();
-}
-
 // Builds the RAM index of file offsets so we can seek() quickly later
 bool loadPlaylist() {
     songOffsets.clear();
@@ -661,6 +847,7 @@ void drawProgressBar(bool force = false) {
     if (currentWidth > maxWidth) currentWidth = maxWidth;
 
     if (force || currentWidth != lastProgressWidth) {
+        M5Cardputer.Display.fillRect(xStart-3, yStart-3, maxWidth+6, height+6, C_BG_DARK );
         M5Cardputer.Display.fillRect(xStart, yStart, maxWidth, height, C_BG_LIGHT);
         M5Cardputer.Display.fillRect(xStart, yStart, currentWidth, height, C_HIGHLIGHT);
         M5Cardputer.Display.fillCircle(xStart + currentWidth, yStart + 1, 3, C_TEXT_MAIN);
@@ -696,15 +883,7 @@ void drawNowPlayingInfo() {
   M5Cardputer.Display.setCursor(xStart + 5, yStart + 16);
   if (currentTitle.length() > 0) {
     M5Cardputer.Display.print(currentTitle.substring(0, 15));
-  } else {
-    if(songList.size() > 0) {
-        String f = songList[currentFileIndex];
-        int slashIdx = f.lastIndexOf('/');
-        if(slashIdx >= 0) f = f.substring(slashIdx+1);
-        M5Cardputer.Display.print(f.substring(0, 15));
-    }
-  }
-
+  } 
   drawProgressBar(true);
   
   int vol = M5Cardputer.Speaker.getVolume();
@@ -767,22 +946,28 @@ void drawVisualizer() {
 // --- POPUPS ---
 // UPDATED HELP TEXT
 const std::vector<String> helpLines = {
-  "Welcome to Music Player",
-  "Enter: Play / Pause Selected", 
-  "; / . : Scroll Playlist",
+  "--- MUSIC PLAYER ---",
+  "Enter: Play / Pause", 
+  "; / . : Scroll / Navigate",
   "[ / ] : Volume - / +",
   "N / B : Next / Prev Song",
   "/ / , : Seek +5s / -5s",
   "S: Shuffle   L: Loop Mode", 
   "M: Settings  V: Visualizer",
-  "For On the Go use Btn A",
-  "1 click : Play / Pause",
-  "2 / 3 : Next / Prev Song",
-  "Screen Wont turn on",
   "I: Close Help",
+  "--- SMART FEATURES ---",
+  "Web UI: Enable Wi-Fi in",
+  "settings to access WebUI.",
+  "Power Saver: Underclock",
+  "CPU to save battery life.",
+  "--- POCKET MODE ---",
+  "Btn A (1 Click): Play/Pause",
+  "Btn A (2 Clicks): Next",
+  "Btn A (3 Clicks): Prev",
+  "Press any key to wake screen",
+  "---",
   "GH: github.com/sanchitminda",
-  "Let me know you like it and",
-  "Share your sugestion"
+  "Share your suggestions!"
 };
 
 void drawHelpPopup() {
@@ -808,6 +993,7 @@ void drawHelpPopup() {
 }
 void drawSettingsMenu() {
     int px = 20; int py = 15; int pw = 200; int ph = 135;
+    const char* powerModeLabels[] = { "OFF", "BASIC (160)", "ULTRA (80)" };
     M5Cardputer.Display.fillRoundRect(px, py, pw, ph, 4, C_BG_LIGHT);
     M5Cardputer.Display.drawRoundRect(px, py, pw, ph, 4, C_ACCENT);
     
@@ -840,15 +1026,19 @@ void drawSettingsMenu() {
             M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
         }
 
-// Content logic
+        // Content logic
         switch (idx) {
             case 0: M5Cardputer.Display.printf("Brightness: %d", userSettings.brightness); break;
             case 1: M5Cardputer.Display.printf("Screen Off: %s", timeoutLabels[userSettings.timeoutIndex]); break;
             case 2: M5Cardputer.Display.printf("Resume Play: %s", userSettings.resumePlay ? "ON" : "OFF"); break;
             case 3: M5Cardputer.Display.printf("DAC Rate: %s", sampleRateLabels[userSettings.spkRateIndex]); break;
             case 4: M5Cardputer.Display.printf("Wi-Fi Power: %s", userSettings.wifiEnabled ? "ON" : "OFF"); break;
-            case 5: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break;
-            case 6: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;
+            case 5: M5Cardputer.Display.printf("Wi-Fi Mode: %s", userSettings.isAPMode ? "AP (Host)" : "STA (Client)"); break; // <-- NEW
+            case 6: M5Cardputer.Display.printf("Power Saver: %s", powerModeLabels[userSettings.powerSaverMode]); break;
+            case 7: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; // Moved down
+            case 8: M5Cardputer.Display.print("> Setup AP (Host)"); break;
+            case 9: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    // Moved down
+            
         }
     }
 
@@ -1092,27 +1282,45 @@ void setup() {
 
   loadConfig();
 
-  if (userSettings.wifiEnabled && userSettings.wifiSSID.length() > 0) {
+if (userSettings.wifiEnabled) {
       M5Cardputer.Display.fillScreen(C_BG_DARK);
       M5Cardputer.Display.setCursor(10, 40);
       M5Cardputer.Display.setTextColor(C_ACCENT);
-      M5Cardputer.Display.print("Connecting to Wi-Fi...");
-      
-      WiFi.begin(userSettings.wifiSSID.c_str(), userSettings.wifiPass.c_str());
-      int retry = 0;
-      while (WiFi.status() != WL_CONNECTED && retry < 15) {
-          delay(500); M5Cardputer.Display.print("."); retry++;
-      }
 
-      if (WiFi.status() == WL_CONNECTED) {
+      if (userSettings.isAPMode) {
+          // --- AP MODE START ---
+          M5Cardputer.Display.print("Starting AP Mode...");
+          WiFi.mode(WIFI_AP);
+          
+          // The network name and password (password must be at least 8 characters)
+          WiFi.softAP(userSettings.apSSID.c_str(), userSettings.apPass.c_str()); 
+          delay(1500);
+
           server.on("/", handleRoot);
           server.on("/api/songs", handleSongList);
           server.on("/stream", handleStream);
+          server.on("/download", handleDownload);
           server.begin();
-      } else {
-          // Fallback if password was wrong
-          M5Cardputer.Display.print("\nFailed! Starting Offline Mode.");
-          delay(2000);
+      } else if (userSettings.wifiSSID.length() > 0) {
+          // --- STANDARD CLIENT MODE START ---
+          M5Cardputer.Display.print("Connecting to Wi-Fi...");
+          WiFi.mode(WIFI_STA);
+          WiFi.begin(userSettings.wifiSSID.c_str(), userSettings.wifiPass.c_str());
+          int retry = 0;
+          while (WiFi.status() != WL_CONNECTED && retry < 15) {
+              delay(500); M5Cardputer.Display.print("."); retry++;
+          }
+
+          if (WiFi.status() == WL_CONNECTED) {
+              server.on("/", handleRoot);
+              server.on("/api/songs", handleSongList);
+              server.on("/stream", handleStream);
+              server.on("/download", handleDownload);
+              server.begin();
+          } else {
+              M5Cardputer.Display.print("\nFailed! Starting Offline Mode.");
+              delay(2000);
+          }
       }
   } else {
       WiFi.mode(WIFI_OFF); // Save battery!
@@ -1186,6 +1394,7 @@ void loop() {
   if (userSettings.timeoutIndex > 0 && !isScreenOff) {
       if (millis() - lastInputTime > timeoutValues[userSettings.timeoutIndex]) {
           M5Cardputer.Display.setBrightness(0);
+          M5Cardputer.Display.sleep(); // <-- Turns off the LCD controller
           isScreenOff = true;
       }
   }
@@ -1197,10 +1406,19 @@ void loop() {
       next_song(true); 
       if(userSettings.resumePlay) saveConfig();
     }
-    
+    static unsigned long lastVisTime = 0;
     if (!showHelpPopup && !showSettingsMenu && showVisualizer && !isScreenOff) {
-        drawVisualizer();
-        drawProgressBar();
+        if (millis() - lastVisTime > visRefreshTime) { 
+            drawVisualizer();
+            lastVisTime = millis();
+        }
+    }
+    static unsigned long lastProgTime = 0;
+    if (!showHelpPopup && !showSettingsMenu && !isScreenOff) {
+        if (millis() - lastProgTime > 500) { 
+            drawProgressBar();
+            lastProgTime = millis();
+        }
     }
     
     if (millis() - lastBatteryUpdate > BATTERY_UPDATE_INTERVAL) {
@@ -1212,45 +1430,65 @@ void loop() {
   // Input Handling
   if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
       if (isScreenOff) {
+          M5Cardputer.Display.wakeup();
           M5Cardputer.Display.setBrightness(userSettings.brightness);
           isScreenOff = false;
           lastInputTime = millis();
+          redrawUI();
           return;
       }
-      // --- PASSWORD TYPING LOGIC ---
-      if (showPasswordInput) {
-          auto status = M5Cardputer.Keyboard.keysState();
-          bool redraw = false;
-          
-          if (status.del && enteredPassword.length() > 0) {
-              enteredPassword.remove(enteredPassword.length() - 1);
-              redraw = true;
-          } else if (status.enter) {
-              userSettings.wifiPass = enteredPassword;
-              userSettings.wifiEnabled = true;
-              saveConfig();
-              showPasswordInput = false;
-              
-              // Trigger a reboot to apply new Wi-Fi safely
-              M5Cardputer.Display.fillScreen(C_BG_DARK);
-              M5Cardputer.Display.setCursor(10, 40);
-              M5Cardputer.Display.print("Saved! Rebooting...");
-              delay(1000);
-              ESP.restart(); 
-          } else if (M5Cardputer.Keyboard.isKeyPressed('m') || M5Cardputer.Keyboard.isKeyPressed('`')) {
-              showPasswordInput = false;
-              showSettingsMenu = true;
-              drawSettingsMenu();
-          } else {
-              // Append typed characters
-              for (char c : status.word) {
-                  enteredPassword += c;
-                  redraw = true;
-              }
-          }
-          if (redraw) drawPasswordInput();
-          return;
-      }
+      // --- TEXT TYPING LOGIC ---
+        if (showTextInput) {
+            auto status = M5Cardputer.Keyboard.keysState();
+            bool redraw = false;
+            
+            if (status.del && enteredText.length() > 0) {
+                enteredText.remove(enteredText.length() - 1);
+                redraw = true;
+            } else if (status.enter) {
+                if (textInputTarget == 0) {
+                    // Saved Client Wi-Fi Password
+                    userSettings.wifiPass = enteredText;
+                    userSettings.wifiEnabled = true;
+                    saveConfig();
+                    showTextInput = false;
+                    ESP.restart(); 
+                } else if (textInputTarget == 1) {
+                    // Saved AP SSID, move to AP Password
+                    userSettings.apSSID = enteredText;
+                    textInputTarget = 2; 
+                    enteredText = userSettings.apPass; // Pre-fill current password
+                    redraw = true;
+                } else if (textInputTarget == 2) {
+                    // Saved AP Password (Requires 8 chars minimum for ESP32 AP to work)
+                    if (enteredText.length() < 8) {
+                        M5Cardputer.Display.setCursor(15, HEADER_HEIGHT + 65);
+                        M5Cardputer.Display.setTextColor(TFT_RED);
+                        M5Cardputer.Display.print("Must be 8+ chars!");
+                        delay(1000);
+                        redraw = true;
+                    } else {
+                        userSettings.apPass = enteredText;
+                        userSettings.isAPMode = true;
+                        userSettings.wifiEnabled = true;
+                        saveConfig();
+                        showTextInput = false;
+                        ESP.restart(); 
+                    }
+                }
+            } else if (M5Cardputer.Keyboard.isKeyPressed('m') || M5Cardputer.Keyboard.isKeyPressed('`')) {
+                showTextInput = false;
+                showSettingsMenu = true;
+                drawSettingsMenu();
+            } else {
+                for (char c : status.word) {
+                    enteredText += c;
+                    redraw = true;
+                }
+            }
+            if (redraw) drawTextInput();
+            return;
+        }
 
       // --- WIFI SCANNER SCROLLING LOGIC ---
       if (showWifiScanner) {
@@ -1269,10 +1507,11 @@ void loop() {
           }
           if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
               userSettings.wifiSSID = WiFi.SSID(wifiCursor);
-              enteredPassword = "";
+              enteredText = "";
               showWifiScanner = false;
-              showPasswordInput = true;
-              drawPasswordInput();
+              showTextInput = true;
+              textInputTarget = 0; // Target: Client Password
+              drawTextInput();
           }
           if (M5Cardputer.Keyboard.isKeyPressed('m')) {
               showWifiScanner = false;
@@ -1354,6 +1593,18 @@ void loop() {
                   userSettings.wifiEnabled = !userSettings.wifiEnabled;
               } 
               else if (settingsCursor == 5) { 
+                  // Toggle Wi-Fi Mode (Applies on next boot)
+                  userSettings.isAPMode = !userSettings.isAPMode;
+              }
+              else if (settingsCursor == 6) { 
+                  // Power Saver Toggle (Cycle 0, 1, 2)
+                  userSettings.powerSaverMode += (isRight ? 1 : -1);
+                  if (userSettings.powerSaverMode > 2) userSettings.powerSaverMode = 0;
+                  if (userSettings.powerSaverMode < 0) userSettings.powerSaverMode = 2;
+                  
+                  applyCpuFrequency(); // Apply immediately!
+              }
+              else if (settingsCursor == 7) { 
                   // --- ENTER WI-FI SETUP ---
                   M5Cardputer.Display.fillScreen(C_BG_DARK);
                   M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
@@ -1379,7 +1630,16 @@ void loop() {
                   drawWifiScanner();
                   return; // Important: Exit so we don't redraw the settings menu!
               } 
-              else if (settingsCursor == 6) { 
+              else if (settingsCursor == 8) { 
+                  // --- ENTER AP SETUP ---
+                  showSettingsMenu = false;
+                  showTextInput = true;
+                  textInputTarget = 1; // Target: AP SSID
+                  enteredText = userSettings.apSSID;
+                  drawTextInput();
+                  return;
+              }
+              else if (settingsCursor == 9) { 
                   // Rescan Library
                   stop_audio();
                   performFullScan(); 
@@ -1423,7 +1683,6 @@ void loop() {
       }
 
       // --- MAIN CONTROLS ---
-      
       if (M5Cardputer.Keyboard.isKeyPressed('m')) {
           showSettingsMenu = true;
           drawSettingsMenu();
