@@ -26,7 +26,16 @@ A fully featured, standalone MP3 player designed specifically for the **M5Stack 
 
 * **ℹ️ On-Device Help:**
     * Press `I` to open a scrollable Help popup listing all keyboard shortcuts.
+ 
+* **Memory-Optimized Playback:** Scans and indexes SD card directories using byte offsets, allowing for massive playlists without running out of RAM.
+  
+* **Web Streamer (NAS Mode):** Connect to an existing Wi-Fi network or spin up a standalone Access Point (Host Mode). Access a clean Web UI from your phone or PC to stream or download MP3s directly from the Cardputer.
 
+* **Smart Power Management:** * **Power Saver Modes:** Dynamically underclocks the CPU when Wi-Fi is off. Choose between Basic (160MHz) or Ultra (80MHz) to massively extend battery life.
+
+* **Display Sleep:** Automatically powers down the LCD controller chip during screen timeouts.
+
+* **Pocket Mode:** Control playback without looking at the screen using the Cardputer's Button A (G0) click combinations.
 ## 🛠️ Hardware Requirements
 
 * **M5Stack Cardputer** (ESP32-S3 based)
@@ -64,18 +73,34 @@ This project is built using the **Arduino IDE**. You need to install the followi
 
 | Key | Function | Description |
 | :--- | :--- | :--- |
-| **P** | Play / Pause | Toggle playback. |
-| **N** | Next Track | Skip to the next song. |
-| **B** | Previous Track | Go back to the previous song. |
-| **S** | Shuffle | Toggle Shuffle mode On/Off. |
-| **L** | Loop Mode | Cycle: `1X` (No Loop) -> `ALL` (Loop All) -> `ONE` (Loop Song). |
-| **/** | Fast Forward | Jump forward 5 seconds. |
-| **,** | Rewind | Jump backward 5 seconds. |
-| **;** | Vol Up / Scroll Up | Increases Volume. Scrolls Up if Help/Menu is open. |
-| **.** | Vol Down / Scroll Down | Decreases Volume. Scrolls Down if Help/Menu is open. |
-| **V** | Visualizer | Toggle the audio visualizer bars On/Off. |
-| **M** | Menu | Open the System Menu (Rescan SD Card). |
-| **I** | Help | Open/Close the Help Shortcut popup. |
+| **Enter** | Play / Pause Selected
+| **; / .** |  Scroll Playlist Up / Down | Scrolls Up / Down playlist or Menu if Help/Menu is open. |
+| **`[` / `]`** |  Volume - / + | Decrease or Increases Volume. 
+| **N / B** |  Next / Previous Song  | Go back to the previous or next song. |
+| **`/ / ,** |  Seek Forward 5s / Seek Backward 5s | 
+| **S** | Toggle Shuffle | Toggle Shuffle mode On/Off. |
+| **L** | Toggle Loop Mode (All / One / None) | Cycle: 1X (No Loop) -> ALL (Loop All) -> ONE (Loop Song). |
+| **V** | Toggle Visualizer | Toggle the audio visualizer bars On/Off. |
+| **M** | Open Settings Menu | Open the System Menu (Rescan SD Card). |
+| **I** | Open Help Menu | Open/Close the Help Shortcut popup. |
+### Pocket Mode (Button A / G0)
+
+* **1 Click**: Play / Pause
+* **2 Clicks**: Next Song
+* **3 Clicks**: Previous Song
+
+*Note: Press any keyboard key to wake the screen if it has timed out.*
+
+## 🌐 Web Server & Wi-Fi Setup
+
+Press `M` to enter the Settings menu to configure Wi-Fi:
+
+1. **Wi-Fi Mode:** Toggle between `STA (Client)` to connect to your home router, or `AP (Host)` to broadcast a network directly from the Cardputer.
+2. **Setup Network:** Follow the on-screen prompts to scan for networks and enter passwords.
+3. **Toggle Wi-Fi Power:** Turn Wi-Fi `ON`. The device will restart and apply the settings.
+4. The IP address will be displayed on the screen header. Navigate to that IP on a device connected to the same network to access the Web UI.
+
+*(Note: Enabling Wi-Fi automatically forces the CPU to 240MHz for network stability, temporarily disabling Power Saver modes).*
 
 ## 📂 File Structure
 
@@ -107,3 +132,14 @@ This project is open-source. Feel free to modify and improve it!
 **Credits:**
 * Audio processing powered by the [ESP8266Audio Library](https://github.com/earlephilhower/ESP8266Audio).
 * UI and Hardware integration via M5Stack libraries.
+## 🐛 Known Issues / Notes
+
+* **Audio Stuttering:** If you experience audio stuttering while on `ULTRA (80MHz)` Power Saver mode, your MP3 bitrates may be too high for the underclocked CPU. Switch to `BASIC (160MHz)`.
+* **SD Card Limit:** The ESP32 requires file paths to start with a `/`. Ensure your SD card is clean and not corrupted.
+
+## 👨‍💻 Author
+
+Created by [Sanchit Minda](https://www.google.com/search?q=https://github.com/sanchitminda)
+
+If you like this project, feel free to star the repo and share your suggestions!
+
