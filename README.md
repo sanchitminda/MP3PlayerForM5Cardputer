@@ -81,7 +81,7 @@ This project is built using the **Arduino IDE**. You need to install the followi
 | **S** | Toggle Shuffle | Toggle Shuffle mode On/Off. |
 | **L** | Toggle Loop Mode (All / One / None) | Cycle: 1X (No Loop) -> ALL (Loop All) -> ONE (Loop Song). |
 | **V** | Toggle Visualizer | Toggle the audio visualizer bars On/Off. |
-| **M** | Open Settings Menu | Open the System Menu (Rescan SD Card). |
+| **Esc** | Open Settings Menu | Open the System Menu (Rescan SD Card). |
 | **I** | Open Help Menu | Open/Close the Help Shortcut popup. |
 ### Pocket Mode (Button A / G0)
 
