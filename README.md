@@ -124,6 +124,7 @@ The application automatically creates a cache file on your SD card after the fir
     * This can happen with very high bitrate files (320kbps+) or slow SD cards. The code is optimized for 128kbps - 192kbps MP3s.
 * **Compilation Errors:**
     * Ensure you have installed `ESP8266Audio` version 1.9.7 or later.
+    * Refer to https://github.com/sanchitminda/MP3PlayerForM5Cardputer/issues/5 
 
 ## 📜 License
 
