@@ -7,6 +7,9 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <nvs_flash.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
 // Audio Libraries
 #include <AudioOutput.h>
 #include <AudioFileSourceSD.h>
@@ -14,25 +17,12 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioGeneratorFLAC.h>
 #include <AudioGeneratorAAC.h>
-#include <AudioGeneratorWAV.h> // NEW: WAV Support
+#include <AudioGeneratorWAV.h>
 #include <AudioFileSourceBuffer.h>
-#include <WiFi.h>
-#include <WebServer.h>
 
-// --- WEB SERVER ---
-WebServer server(80);
-Preferences preferences;
-// --- AESTHETIC COLORS ---
-#define C_BG_DARK     0x1002  // Gunmetal
-#define C_BG_LIGHT    0x2124  // Panel Grey
-#define C_HEADER      0x18E3  // Slate Blue
-#define C_ACCENT      0x05BF  // Cyan (Cursor)
-#define C_PLAYING     0x07E0  // Green (Active Song
-#define C_HIGHLIGHT   0xF81F  // Magenta (Progress)
-#define C_TEXT_MAIN   0xFFFF  // White
-#define C_TEXT_DIM    0x9492  // Grey
-
-// --- CONFIG ---
+// ==========================================
+// CONSTANTS & CONFIG
+// ==========================================
 #define SD_SPI_SCK_PIN  40
 #define SD_SPI_MISO_PIN 39
 #define SD_SPI_MOSI_PIN 14
@@ -40,821 +30,126 @@ Preferences preferences;
 #define PLAYLIST_FILE "/playlist.txt"
 #define CONFIG_FILE "/config.txt"
 
-// --- LAYOUT ADJUSTMENTS ---
-// Widened Playlist, Restricted Rows to prevent overlap
-#define PLAYLIST_WIDTH 120      // Increased from 110
+#define PLAYLIST_WIDTH 120
 #define ROW_HEIGHT 15
 #define HEADER_HEIGHT 20
 #define BOTTOM_BAR_HEIGHT 18
-// (135 - 20 - 18) / 15 = 6.4 -> So max 6 rows safely
-#define MAX_VISIBLE_ROWS 6      
+#define MAX_VISIBLE_ROWS 6  
 
-// --- GLOBALS ---
+// Colors
+// #define C_BG_DARK     0x1002
+// #define C_BG_LIGHT    0x2124
+// #define C_HEADER      0x18E3
+// #define C_ACCENT      0x05BF
+// #define C_PLAYING     0x07E0
+// #define C_HIGHLIGHT   0xF81F
+// #define C_TEXT_MAIN   0xFFFF
+// #define C_TEXT_DIM    0x9492
+
+// --- DYNAMIC COLORS & THEMES ---
+uint16_t C_BG_DARK, C_BG_LIGHT, C_HEADER, C_ACCENT, C_PLAYING, C_HIGHLIGHT, C_TEXT_MAIN, C_TEXT_DIM;
+
+const int NUM_THEMES = 4;
+const char* themeLabels[] = { "Gunmetal Blue", "Cyberpunk", "Retro Amber", "Hacker Green" };
+
+void applyTheme(int index) {
+    switch(index) {
+        case 0: // Gunmetal Blue (Original)
+            C_BG_DARK = 0x1002; C_BG_LIGHT = 0x2124; C_HEADER = 0x18E3;
+            C_ACCENT = 0x05BF; C_PLAYING = 0x07E0; C_HIGHLIGHT = 0xF81F;
+            C_TEXT_MAIN = 0xFFFF; C_TEXT_DIM = 0x9492;
+            break;
+        case 1: // Cyberpunk
+            C_BG_DARK = 0x0803; C_BG_LIGHT = 0x1866; C_HEADER = 0xA013; // Deep purples
+            C_ACCENT = 0x07FF; C_PLAYING = 0xFFE0; C_HIGHLIGHT = 0xF800; // Cyan, Yellow, Pink
+            C_TEXT_MAIN = 0xFFFF; C_TEXT_DIM = 0x7BEF;
+            break;
+        case 2: // Retro Amber
+            C_BG_DARK = TFT_BLACK; C_BG_LIGHT = 0x2104; C_HEADER = 0x6A00; 
+            C_ACCENT = 0xFDA0; C_PLAYING = TFT_ORANGE; C_HIGHLIGHT = TFT_RED;
+            C_TEXT_MAIN = 0xFEA0; C_TEXT_DIM = 0xA340;
+            break;
+        case 3: // Hacker Green
+            C_BG_DARK = 0x0000; C_BG_LIGHT = 0x0180; C_HEADER = 0x0320; 
+            C_ACCENT = 0x07E0; C_PLAYING = 0x07FF; C_HIGHLIGHT = TFT_WHITE;
+            C_TEXT_MAIN = 0x07E0; C_TEXT_DIM = 0x03E0;
+            break;
+    }
+}
 
 enum LoopState { NO_LOOP, LOOP_ALL, LOOP_ONE };
-int currentFileIndex = 0;   // Playing song
-int browserIndex = 0;       // Menu Selection
+enum UIState { UI_PLAYER, UI_SETTINGS, UI_HELP, UI_WIFI_SCAN, UI_TEXT_INPUT };
 
-bool isPaused = false;
-bool isShuffle = false;
-LoopState loopMode = NO_LOOP;
-bool stop_scan = false;
-String currentTitle = "";
-String currentArtist = "";
-
-unsigned long lastBatteryUpdate = 0; 
-unsigned long visRefreshTime = 1; // refresh time for visualizer 
-const unsigned long BATTERY_UPDATE_INTERVAL = 10000; 
-bool showHelpPopup = false;
-bool showMenuPopup = false;
-bool showVisualizer = true;
-int helpScrollOffset = 0;
-uint32_t paused_at = 0;
-
-// Audio Objects
-static AudioFileSourceSD *file = nullptr;
-static AudioFileSourceID3 *id3 = nullptr;
-static AudioFileSourceBuffer *buff = nullptr; 
-static AudioGenerator *decoder = nullptr;
-class AudioOutputM5Speaker;
-static AudioOutputM5Speaker *out = nullptr;
-
-LGFX_Sprite visSprite(&M5Cardputer.Display);
-
-// --- SETTINGS ---
 const uint32_t sampleRateValues[] = { 44100, 48000, 88200, 96000, 128000 };
 const char* sampleRateLabels[] = { "44.1k", "48k", "88.2k", "96k", "128k" };
+const long timeoutValues[] = { 0, 30000, 60000, 120000, 300000 };
+const char* timeoutLabels[] = { "Always On", "30 Sec", "1 Min", "2 Min", "5 Min" };
+const char* powerModeLabels[] = { "OFF", "BASIC (160)", "ULTRA (80)" };
+const char* helpLines[] = {
+  "--- MUSIC PLAYER ---",
+  "Enter: Play / Pause", 
+  "; / . : Scroll / Navigate",
+  "[ / ] : Volume - / +",
+  "N / B : Next / Prev Song",
+  "/ / , : Seek +5s / -5s",
+  "S: Shuffle   L: Loop Mode", 
+  "Esc / ` : Settings",
+  "V: Visualizer",
+  "I: Close Help",
+  "--- SMART FEATURES ---",
+  "Web UI: Enable Wi-Fi in",
+  "settings to access.",
+  "Power Saver: Underclock",
+  "CPU to save battery life.",
+  "--- POCKET MODE ---",
+  "Btn A (1 Click): Play/Pause",
+  "Btn A (2 Clicks): Next",
+  "Btn A (3 Clicks): Prev",
+  "Press any key to wake screen",
+  "---",
+  "GH: github.com/sanchitminda"
+};
+const int numHelpLines = 22;
 
+// ==========================================
+// GLOBALS
+// ==========================================
 struct Settings {
     int brightness = 100;      
+    int themeIndex = 0;
     int timeoutIndex = 0;      
     bool resumePlay = true;    
     int spkRateIndex = 4;      
     int lastIndex = 0;         
     uint32_t lastPos = 0;      
-    bool wifiEnabled = false;  // NEW: Toggle Wi-Fi Power
-    String wifiSSID = "";      // NEW: Saved Network Name
-    String wifiPass = "";      // NEW: Saved Password
+    bool wifiEnabled = false;  
+    String wifiSSID = "";      
+    String wifiPass = "";      
     bool isAPMode = false;
-    String apSSID = "Cardputer";   // NEW: Default AP Name
-    String apPass = "12345678";    // NEW: Default AP Password
-    int powerSaverMode = 0;        // NEW: 0=OFF, 1=BASIC(160MHz), 2=ULTRA(80MHz)
+    String apSSID = "Cardputer";   
+    String apPass = "12345678";    
+    int powerSaverMode = 0;        
 };
+
 Settings userSettings;
-bool showSettingsMenu = false;
-int settingsCursor = 0; 
-const int TOTAL_SETTINGS = 12;      // Total number of items in the menu
-const int MAX_MENU_ROWS = 4;       // How many items fit on the screen at once
-int menuScrollOffset = 0;          // Tracks which item is at the top of the menu
+Preferences preferences;
+WebServer server(80);
+LGFX_Sprite visSprite(&M5Cardputer.Display);
 
-// --- WIFI UI GLOBALS ---
-bool showWifiScanner = false;
-int wifiCursor = 0;
-int wifiScrollOffset = 0;
-int wifiNetworkCount = 0;
-// String enteredPassword = "";
-bool showTextInput = false;
-int textInputTarget = 0; // 0 = STA Pass, 1 = AP Name, 2 = AP Pass
-String enteredText = "";
-
-// --- GLOBALS ---
-std::vector<uint32_t> songOffsets; // Stores file byte positions instead of Strings
+UIState currentState = UI_PLAYER;
 unsigned long lastInputTime = 0;
 bool isScreenOff = false;
-const long timeoutValues[] = { 0, 30000, 60000, 120000, 300000 };
-const char* timeoutLabels[] = { "Always On", "30 Sec", "1 Min", "2 Min", "5 Min" };
 
+// Text Input Globals
+int textInputTarget = 0; // 0=STA Pass, 1=AP SSID, 2=AP Pass
+String enteredText = "";
 
-// --- CONFIG FUNCTIONS ---
-void saveConfig() {
-    // Always save the position, even if it's paused
-    if (id3) {
-        userSettings.lastIndex = currentFileIndex;
-        userSettings.lastPos = isPaused ? paused_at : id3->getPos();
-    }
-    
-    // Open NVS namespace "sam_music" in Read/Write mode (false)
-    preferences.begin("sam_music", false);
-    
-    preferences.putInt("brightness", userSettings.brightness);
-    preferences.putInt("timeoutIndex", userSettings.timeoutIndex);
-    preferences.putBool("resumePlay", userSettings.resumePlay);
-    preferences.putInt("spkRate", userSettings.spkRateIndex);
-    preferences.putInt("lastIndex", userSettings.lastIndex);
-    preferences.putUInt("lastPos", userSettings.lastPos);
-    preferences.putBool("wifiEnabled", userSettings.wifiEnabled);
-    preferences.putString("wifiSSID", userSettings.wifiSSID);
-    preferences.putString("wifiPass", userSettings.wifiPass);
-    preferences.putBool("isAPMode", userSettings.isAPMode);
-    preferences.putString("apSSID", userSettings.apSSID);
-    preferences.putString("apPass", userSettings.apPass);
-    preferences.putInt("powerMode", userSettings.powerSaverMode);
-    
-    preferences.end();
-}
-
-void loadConfig() {
-    // Open NVS namespace in Read-Only mode (true)
-    preferences.begin("sam_music", true);
-    
-    // The second parameter is the default value if the key doesn't exist yet
-    userSettings.brightness = preferences.getInt("brightness", 100);
-    userSettings.timeoutIndex = preferences.getInt("timeoutIndex", 0);
-    userSettings.resumePlay = preferences.getBool("resumePlay", true);
-    userSettings.spkRateIndex = preferences.getInt("spkRate", 4);
-    userSettings.lastIndex = preferences.getInt("lastIndex", 0);
-    userSettings.lastPos = preferences.getUInt("lastPos", 0);
-    userSettings.wifiEnabled = preferences.getBool("wifiEnabled", false);
-    userSettings.wifiSSID = preferences.getString("wifiSSID", "");
-    userSettings.wifiPass = preferences.getString("wifiPass", "");
-    userSettings.isAPMode = preferences.getBool("isAPMode", false);
-    userSettings.apSSID = preferences.getString("apSSID", "Cardputer");
-    userSettings.apPass = preferences.getString("apPass", "12345678");
-    userSettings.powerSaverMode = preferences.getInt("powerMode", 0);
-    
-    preferences.end();
-
-    // Failsafe defaults
-    if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
-    if(userSettings.apPass.length() < 8) userSettings.apPass = "12345678";
-    if (userSettings.brightness < 5) userSettings.brightness = 5;
-    if (userSettings.brightness > 255) userSettings.brightness = 255;
-    if (userSettings.timeoutIndex < 0 || userSettings.timeoutIndex > 4) userSettings.timeoutIndex = 0;
-
-    applyCpuFrequency();
-}
-
-void exportConfigToSD() {
-    if (SD.exists(CONFIG_FILE)) SD.remove(CONFIG_FILE);
-    File file = SD.open(CONFIG_FILE, FILE_WRITE);
-    if (file) {
-        file.println(userSettings.brightness);
-        file.println(userSettings.timeoutIndex);
-        file.println(userSettings.resumePlay ? 1 : 0);
-        file.println(userSettings.spkRateIndex);
-        file.println(userSettings.lastIndex);
-        file.println(userSettings.lastPos);
-        file.println(userSettings.wifiEnabled ? 1 : 0);
-        file.println(userSettings.wifiSSID);
-        file.println(userSettings.wifiPass);
-        file.println(userSettings.isAPMode ? 1 : 0);
-        file.println(userSettings.apSSID);
-        file.println(userSettings.apPass);
-        file.println(userSettings.powerSaverMode);
-        file.close();
-        
-        M5Cardputer.Display.fillScreen(C_BG_DARK);
-        M5Cardputer.Display.setCursor(10, 40);
-        M5Cardputer.Display.setTextColor(C_PLAYING);
-        M5Cardputer.Display.print("Exported to SD!");
-        delay(1000);
-    }
-}
-
-void importConfigFromSD() {
-    if (!SD.exists(CONFIG_FILE)) {
-        M5Cardputer.Display.fillScreen(C_BG_DARK);
-        M5Cardputer.Display.setCursor(10, 40);
-        M5Cardputer.Display.setTextColor(TFT_RED);
-        M5Cardputer.Display.print("No config.txt found!");
-        delay(1000);
-        return;
-    }
-    
-    File file = SD.open(CONFIG_FILE);
-    if (file) {
-        if(file.available()) userSettings.brightness = file.readStringUntil('\n').toInt();
-        if(file.available()) userSettings.timeoutIndex = file.readStringUntil('\n').toInt();
-        if(file.available()) userSettings.resumePlay = (file.readStringUntil('\n').toInt() == 1);
-        if(file.available()) userSettings.spkRateIndex = file.readStringUntil('\n').toInt();
-        if(file.available()) userSettings.lastIndex = file.readStringUntil('\n').toInt();
-        if(file.available()) userSettings.lastPos = file.readStringUntil('\n').toInt();
-        if(file.available()) userSettings.wifiEnabled = (file.readStringUntil('\n').toInt() == 1);
-        if(file.available()) { userSettings.wifiSSID = file.readStringUntil('\n'); userSettings.wifiSSID.trim(); }
-        if(file.available()) { userSettings.wifiPass = file.readStringUntil('\n'); userSettings.wifiPass.trim(); }
-        if(file.available()) userSettings.isAPMode = (file.readStringUntil('\n').toInt() == 1);
-        if(file.available()) { userSettings.apSSID = file.readStringUntil('\n'); userSettings.apSSID.trim(); }
-        if(file.available()) { userSettings.apPass = file.readStringUntil('\n'); userSettings.apPass.trim(); }
-        if(file.available()) userSettings.powerSaverMode = file.readStringUntil('\n').toInt();
-        file.close();
-        
-        saveConfig(); // Commit the imported settings to internal NVS
-        applyCpuFrequency();
-        M5Cardputer.Display.setBrightness(userSettings.brightness);
-        
-        M5Cardputer.Display.fillScreen(C_BG_DARK);
-        M5Cardputer.Display.setCursor(10, 40);
-        M5Cardputer.Display.setTextColor(C_PLAYING);
-        M5Cardputer.Display.print("Imported from SD!");
-        delay(1000);
-    }
-}
-
-// --- WEB SERVER FUNCTIONS ---
-void applyCpuFrequency() {
-    // Wi-Fi requires high clock speeds to remain stable
-    if (userSettings.wifiEnabled) {
-        setCpuFrequencyMhz(240); 
-    } else {
-        if (userSettings.powerSaverMode == 2) {
-            setCpuFrequencyMhz(80);  // ULTRA
-            visRefreshTime = 100;
-        } else if (userSettings.powerSaverMode == 1) {
-            setCpuFrequencyMhz(160); // BASIC
-            visRefreshTime = 30;
-        } else {
-            setCpuFrequencyMhz(240); // OFF
-            visRefreshTime = 20 ;
-        }
-    }
-}
-
-// 1. The HTML Web UI (Now with Cover Art & Metadata Parsing!)
-void handleRoot() {
-    String html = R"rawliteral(
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Sam Music Player</title>
-        
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js"></script>
-        
-        <style>
-            :root {
-                --bg-dark: #15181C;
-                --bg-light: #252830;
-                --slate-blue: #4A5B82;
-                --cyan: #00E5FF;
-                --green: #00FF66;
-                --magenta: #FF007F;
-            }
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: var(--bg-dark); color: #ffffff; padding: 20px; max-width: 650px; margin: 0 auto; }
-            h1 { color: var(--cyan); text-align: center; font-weight: 300; letter-spacing: 2px; }
-            
-            /* Sticky Player Header */
-            .player-card { background: var(--bg-light); padding: 20px; border-radius: 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.6); position: sticky; top: 10px; z-index: 100; border: 1px solid #333;}
-            
-            /* Now Playing Layout (Cover Art + Text side-by-side) */
-            .now-playing-container { display: flex; align-items: center; gap: 20px; margin-bottom: 20px; }
-            
-            .cover-wrapper { width: 100px; height: 100px; flex-shrink: 0; background: var(--bg-dark); border-radius: 8px; display: flex; justify-content: center; align-items: center; overflow: hidden; border: 1px solid var(--slate-blue); box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
-            #cover-art { width: 100%; height: 100%; object-fit: cover; display: none; }
-            #cover-placeholder { color: var(--slate-blue); font-size: 30px; }
-            
-            .track-details { flex-grow: 1; overflow: hidden; }
-            #track-title { font-size: 1.3em; color: var(--green); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: bold; margin-bottom: 4px; }
-            #track-artist { font-size: 1em; color: var(--cyan); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px; }
-            #track-album { font-size: 0.85em; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-            audio { width: 100%; margin-bottom: 15px; outline: none; border-radius: 5px; height: 40px; }
-            
-            /* Transport Controls */
-            .controls { display: flex; justify-content: center; gap: 12px; margin-bottom: 5px; }
-            button { background: var(--slate-blue); color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-size: 16px; transition: all 0.2s; }
-            button:hover { background: var(--cyan); color: var(--bg-dark); transform: scale(1.05); }
-            button.active { background: var(--magenta); color: white; }
-            
-            /* Search Bar */
-            .search-box { margin-top: 25px; text-align: center; }
-            #searchBar { width: 100%; padding: 12px 20px; border-radius: 25px; border: 1px solid var(--slate-blue); background: var(--bg-dark); color: white; font-size: 16px; outline: none; transition: 0.3s; box-sizing: border-box;}
-            #searchBar:focus { border-color: var(--cyan); box-shadow: 0 0 8px rgba(0, 229, 255, 0.4); background: var(--bg-light); }
-            
-            /* Playlist */
-            ul { list-style: none; padding: 0; margin-top: 20px;}
-            li { display: flex; justify-content: space-between; align-items: center; background: var(--bg-light); margin-bottom: 8px; border-radius: 6px; transition: 0.2s; border-left: 4px solid transparent; }
-            li:hover { background: var(--slate-blue); }
-            li.playing { background: #1A2933; border-left: 4px solid var(--cyan); }
-            
-            .song-info { flex-grow: 1; padding: 14px; cursor: pointer; display: flex; align-items: center; }
-            .track-num { color: #888; margin-right: 15px; font-size: 0.85em; width: 25px; text-align: right; }
-            li.playing .track-num { color: var(--cyan); font-weight: bold;}
-            li.playing .track-name { color: var(--cyan); font-weight: bold;}
-            
-            /* Download Button */
-            .dl-btn { background: #333; color: white; text-decoration: none; padding: 8px 12px; border-radius: 4px; margin-right: 10px; font-size: 1.1em; transition: 0.2s; }
-            .dl-btn:hover { background: var(--magenta); transform: scale(1.1); }
-        </style>
-    </head>
-    <body>
-        <h1>SAM MUSIC PLAYER</h1>
-        
-        <div class="player-card">
-            <div class="now-playing-container">
-                <div class="cover-wrapper">
-                    <div id="cover-placeholder">🎵</div>
-                    <img id="cover-art" src="" alt="Cover Art">
-                </div>
-                <div class="track-details">
-                    <div id="track-title">Select a song to start</div>
-                    <div id="track-artist">Waiting for selection...</div>
-                    <div id="track-album"></div>
-                </div>
-            </div>
-
-            <audio id="player" controls></audio>
-            
-            <div class="controls">
-                <button id="btnPrev" title="Previous Song">⏮</button>
-                <button id="btnNext" title="Next Song">⏭</button>
-                <button id="btnShuffle" title="Toggle Shuffle">🔀</button>
-                <button id="btnLoop" title="Toggle Loop Mode">🔁</button>
-            </div>
-        </div>
-
-        <div class="search-box">
-            <input type="text" id="searchBar" placeholder="Search for old Bollywood classics, artists, or albums...">
-        </div>
-
-        <ul id="playlist"><li>Loading library from SD...</li></ul>
-
-        <script>
-            let songs = [];
-            let currentIndex = -1;
-            let isShuffle = false;
-            let loopMode = 0;
-            
-            const player = document.getElementById('player');
-            const btnPrev = document.getElementById('btnPrev');
-            const btnNext = document.getElementById('btnNext');
-            const btnShuffle = document.getElementById('btnShuffle');
-            const btnLoop = document.getElementById('btnLoop');
-            const playlistEl = document.getElementById('playlist');
-            const searchBar = document.getElementById('searchBar');
-
-            const titleEl = document.getElementById('track-title');
-            const artistEl = document.getElementById('track-artist');
-            const albumEl = document.getElementById('track-album');
-            const coverArt = document.getElementById('cover-art');
-            const coverPlaceholder = document.getElementById('cover-placeholder');
-
-            // Fetch Library
-            fetch('/api/songs').then(r => r.json()).then(data => {
-                songs = data;
-                playlistEl.innerHTML = '';
-                songs.forEach((song, idx) => {
-                    let li = document.createElement('li');
-                    li.id = 'song-' + idx;
-                    li.className = 'song-item';
-                    
-                    let infoDiv = document.createElement('div');
-                    infoDiv.className = 'song-info';
-                    infoDiv.innerHTML = `<span class="track-num">${idx + 1}</span> <span class="track-name">${song}</span>`;
-                    infoDiv.onclick = () => playSong(idx);
-                    
-                    let dlLink = document.createElement('a');
-                    dlLink.className = 'dl-btn';
-                    dlLink.href = '/download?id=' + idx;
-                    dlLink.title = 'Download Audio';
-                    dlLink.innerText = '💾';
-                    
-                    li.appendChild(infoDiv);
-                    li.appendChild(dlLink);
-                    playlistEl.appendChild(li);
-                });
-            }).catch(err => {
-                playlistEl.innerHTML = '<li style="color:red; padding:15px;">Error loading library. Ensure SD card is inserted.</li>';
-            });
-            // Real-time Search Logic
-            searchBar.addEventListener('input', (e) => {
-                const term = e.target.value.toLowerCase();
-                const items = playlistEl.getElementsByClassName('song-item');
-                Array.from(items).forEach(item => {
-                    const songName = item.querySelector('.track-name').innerText.toLowerCase();
-                    item.style.display = songName.includes(term) ? 'flex' : 'none';
-                });
-            });
-            // Core Playback & Metadata Logic
-            function playSong(index) {
-                if (index < 0 || index >= songs.length) return;
-                if (currentIndex !== -1) {
-                    let oldLi = document.getElementById('song-' + currentIndex);
-                    if(oldLi) oldLi.classList.remove('playing');
-                }
-                currentIndex = index;
-                let newLi = document.getElementById('song-' + currentIndex);
-                if(newLi) {
-                    newLi.classList.add('playing');
-                    newLi.scrollIntoView({ behavior: 'smooth', block: 'center' }); 
-                }
-                const fileUrl = '/stream?id=' + currentIndex;
-                const metaUrl = fileUrl + '&meta=1';
-                const fallbackName = songs[currentIndex];
-                // 1. CLEAR AUDIO SOURCE FIRST
-                // This forces the browser to drop the previous connection, freeing the ESP32
-                player.src = ''; 
-                // 2. RESET UI
-                titleEl.innerText = 'Loading...';
-                artistEl.innerText = '';
-                albumEl.innerText = '';
-                coverArt.style.display = 'none';
-                coverPlaceholder.style.display = 'block';
-                // 3. FETCH METADATA CHUNK (640KB)
-                fetch(metaUrl)
-                    .then(res => res.blob())
-                    .then(blob => {
-                        window.jsmediatags.read(blob, {
-                            onSuccess: function(tag) {
-                                const tags = tag.tags;
-                                titleEl.innerText = tags.title || fallbackName;
-                                artistEl.innerText = tags.artist || 'Unknown Artist';
-                                albumEl.innerText = tags.album || '';
-
-                                // Lightning-fast Image Rendering using Object URLs
-                                if (tags.picture) {
-                                    try {
-                                        const byteArray = new Uint8Array(tags.picture.data);
-                                        const imgBlob = new Blob([byteArray], { type: tags.picture.format });
-                                        coverArt.src = URL.createObjectURL(imgBlob);
-                                        coverArt.style.display = 'block';
-                                        coverPlaceholder.style.display = 'none';
-                                    } catch (e) {
-                                        console.error("Error decoding image:", e);
-                                    }
-                                }
-                                
-                                // 4. START PLAYBACK
-                                player.src = fileUrl;
-                                player.play();
-                            },
-                            onError: function(error) {
-                                console.error('jsmediatags Error:', error.info);
-                                titleEl.innerText = fallbackName;
-                                artistEl.innerText = 'Unknown Artist';
-                                player.src = fileUrl;
-                                player.play();
-                            }
-                        });
-                    })
-                    .catch(err => {
-                        console.error('Fetch Error:', err);
-                        titleEl.innerText = fallbackName;
-                        artistEl.innerText = 'Unknown Artist';
-                        player.src = fileUrl;
-                        player.play();
-                    });
-            }
-
-            function playNext() {
-                if (songs.length === 0) return;
-                if (loopMode === 1) { 
-                    playSong(currentIndex);
-                    return;
-                }
-                if (isShuffle) {
-                    let randomIdx;
-                    do { randomIdx = Math.floor(Math.random() * songs.length); } 
-                    while (randomIdx === currentIndex && songs.length > 1);
-                    playSong(randomIdx);
-                } else {
-                    let nextIdx = (currentIndex + 1) % songs.length;
-                    playSong(nextIdx);
-                }
-            }
-
-            function playPrev() {
-                if (songs.length === 0) return;
-                if (currentIndex === -1) currentIndex = 0;
-                let prevIdx = (currentIndex - 1 + songs.length) % songs.length;
-                playSong(prevIdx);
-            }
-
-            // Button Listeners
-            btnNext.onclick = playNext;
-            btnPrev.onclick = playPrev;
-            
-            btnShuffle.onclick = () => {
-                isShuffle = !isShuffle;
-                btnShuffle.classList.toggle('active', isShuffle);
-            };
-            
-            btnLoop.onclick = () => {
-                loopMode = (loopMode + 1) % 2;
-                btnLoop.innerText = loopMode === 1 ? '🔂' : '🔁';
-                btnLoop.classList.toggle('active', loopMode === 1);
-            };
-
-            player.addEventListener('ended', playNext);
-        </script>
-    </body>
-    </html>
-    )rawliteral";
-    server.send(200, "text/html", html);
-}
-
-void handleDownload() {
-    if (!server.hasArg("id")) {
-        server.send(400, "text/plain", "Missing song ID");
-        return;
-    }
-    
-    int id = server.arg("id").toInt();
-    String path = getSongPath(id);
-    File f = SD.open(path);
-    
-    if (!f) {
-        server.send(404, "text/plain", "File not found");
-        return;
-    }
-    
-    // Extract just the filename to give the downloaded file a proper name
-    int slashIdx = path.lastIndexOf('/');
-    String filename = (slashIdx >= 0) ? path.substring(slashIdx + 1) : path;
-    
-    // Tell the browser to download it as an attachment
-    server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
-    server.streamFile(f, "audio/mpeg");
-    f.close();
-}
-// 2. Stream the Playlist as JSON without crashing RAM or thrashing the SD Card
-void handleSongList() {
-    if (!SD.exists(PLAYLIST_FILE)) {
-        server.send(500, "text/plain", "Playlist not found");
-        return;
-    }
-
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "application/json", "");
-    server.sendContent("[\n");
-
-    File file = SD.open(PLAYLIST_FILE);
-    if (!file) {
-        server.sendContent("]");
-        server.sendContent("");
-        return;
-    }
-
-    String jsonBuffer = "";
-    bool firstItem = true;
-
-    while (file.available()) {
-        String line = file.readStringUntil('\n');
-        line.trim(); // Clean up carriage returns
-        if (line.length() == 0) continue;
-        
-        // Only process valid audio files based on our supported extensions
-        String lineLower = line;
-        lineLower.toLowerCase();
-        if (lineLower.endsWith(".mp3") || lineLower.endsWith(".flac") || 
-            lineLower.endsWith(".m4a") || lineLower.endsWith(".aac") || lineLower.endsWith(".wav")) {
-            
-            // Extract just the filename to make the web UI look clean
-            int slashIdx = line.lastIndexOf('/');
-            if (slashIdx >= 0) line = line.substring(slashIdx + 1);
-
-            // CRITICAL: Escape double quotes in filenames to prevent JSON breaking
-            line.replace("\"", "\\\"");
-
-            if (!firstItem) {
-                jsonBuffer += ",\n";
-            }
-            jsonBuffer += "\"" + line + "\"";
-            firstItem = false;
-
-            // Send in chunks of ~1KB to optimize TCP packets and save RAM
-            if (jsonBuffer.length() > 1024) {
-                server.sendContent(jsonBuffer);
-                jsonBuffer = ""; // Reset buffer
-            }
-        }
-    }
-    file.close();
-
-    // Send any remaining data left in the buffer
-    if (jsonBuffer.length() > 0) {
-        server.sendContent(jsonBuffer);
-    }
-
-    server.sendContent("\n]");
-    server.sendContent(""); // Empty string terminates the chunked response
-}
-
-// 3. Stream the raw MP3 file to the laptop browser
-// 3. Stream the raw audio file OR a metadata chunk to the browser
-void handleStream() {
-    if (!server.hasArg("id")) {
-        server.send(400, "text/plain", "Missing song ID");
-        return;
-    }
-    
-    int id = server.arg("id").toInt();
-    String path = getSongPath(id);
-    File f = SD.open(path);
-    
-    if (!f) {
-        server.send(404, "text/plain", "File not found");
-        return;
-    }
-
-    // --- METADATA CHUNK LOGIC ---
-    // If the browser only wants to read ID3 tags, send the first 128KB and close.
-    // This prevents the ESP32 from getting locked up!
-    if (server.hasArg("meta")) {
-        size_t chunkSize = 655360; // 128KB is enough for high-res cover art
-        if (f.size() < chunkSize) chunkSize = f.size(); 
-        
-        server.setContentLength(chunkSize);
-        server.send(200, "audio/mpeg", "");
-        
-        uint8_t buffer[2048];
-        size_t remaining = chunkSize;
-        
-        while (f.available() && remaining > 0) {
-            size_t toRead = (remaining < sizeof(buffer)) ? remaining : sizeof(buffer);
-            size_t bytesRead = f.read(buffer, toRead);
-            if (bytesRead == 0) break;
-            server.client().write(buffer, bytesRead);
-            remaining -= bytesRead;
-        }
-        f.close();
-        return;
-    }
-
-    // --- NORMAL AUDIO STREAM ---
-    server.streamFile(f, "audio/mpeg");
-    f.close();
-}
-
-void drawHeader() {
-    M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
-    M5Cardputer.Display.setFont(&fonts::Font0); 
-    
-    String prefix = "Music Player";
-    if (userSettings.wifiEnabled) {
-        if (userSettings.isAPMode) {
-            prefix = WiFi.softAPIP().toString(); // Usually 192.168.4.1
-            M5Cardputer.Display.setTextColor(TFT_ORANGE, C_HEADER); // Orange for AP
-        } else if (WiFi.status() == WL_CONNECTED) {
-            prefix = WiFi.localIP().toString();
-            M5Cardputer.Display.setTextColor(C_ACCENT, C_HEADER);   // Cyan for Client
-        } else {
-            M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
-        }
-    } else {
-        M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
-    }
-    
-    String headerText = prefix + " [" + String(currentFileIndex + 1) + "/" + String(songOffsets.size()) + "]";
-    M5Cardputer.Display.drawString(headerText.c_str(), 5, 5); 
-    
-    drawBattery(); 
-}
-
-void drawWifiScanner() {
-    M5Cardputer.Display.fillScreen(C_BG_DARK);
-    M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
-    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.setCursor(5, 5);
-    M5Cardputer.Display.print("Select Wi-Fi Network");
-
-    int yPos = HEADER_HEIGHT + 5;
-    int visibleRows = 6;
-    
-    if (wifiNetworkCount == 0) {
-        M5Cardputer.Display.setCursor(10, yPos);
-        M5Cardputer.Display.print("No networks found.");
-        return;
-    }
-
-    for (int i = 0; i < visibleRows; i++) {
-        int idx = wifiScrollOffset + i;
-        if (idx >= wifiNetworkCount) break;
-
-        if (idx == wifiCursor) {
-            M5Cardputer.Display.fillRect(2, yPos - 2, M5Cardputer.Display.width() - 4, ROW_HEIGHT, C_ACCENT);
-            M5Cardputer.Display.setTextColor(C_BG_DARK);
-        } else {
-            M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-        }
-
-        String ssid = WiFi.SSID(idx);
-        M5Cardputer.Display.setCursor(10, yPos);
-        M5Cardputer.Display.print(ssid.substring(0, 30));
-        yPos += ROW_HEIGHT;
-    }
-}
-
-void drawTextInput() {
-    M5Cardputer.Display.fillScreen(C_BG_DARK);
-    M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
-    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.setCursor(5, 5);
-    
-    // Dynamic Header based on what we are typing
-    if (textInputTarget == 0) M5Cardputer.Display.print("Enter Client Password:");
-    else if (textInputTarget == 1) M5Cardputer.Display.print("Set AP Name (SSID):");
-    else if (textInputTarget == 2) M5Cardputer.Display.print("Set AP Password (8+ chars):");
-
-    // Draw Input Box
-    M5Cardputer.Display.drawRect(10, HEADER_HEIGHT + 35, M5Cardputer.Display.width() - 20, 25, C_TEXT_MAIN);
-    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.setCursor(15, HEADER_HEIGHT + 40);
-    
-    // Mask the password if it's for the client Wi-Fi, otherwise show text
-    String displayStr = enteredText;
-    if (textInputTarget == 0) { 
-        displayStr = "";
-        for(int i=0; i<enteredText.length(); i++) displayStr += "*";
-    }
-    M5Cardputer.Display.print(displayStr + "_"); // Blink cursor
-
-    M5Cardputer.Display.setCursor(10, M5Cardputer.Display.height() - 20);
-    M5Cardputer.Display.setTextColor(C_TEXT_DIM);
-    M5Cardputer.Display.print("ENTER to Save  |  ESC/M to Cancel");
-}
-
-// --- BATTERY ---
-void drawBattery() {
-    int batLevel = M5Cardputer.Power.getBatteryLevel();
-    bool isCharging = M5.Power.isCharging();
-    int w = 24; int h = 10;
-    int x = M5Cardputer.Display.width() - w - 5; 
-    int y = 5;
-
-    // Clear background area for text and battery
-    M5Cardputer.Display.fillRect(x - 30, 0, w + 35, HEADER_HEIGHT, C_HEADER); 
-
-    // Draw Battery Outline
-    M5Cardputer.Display.drawRect(x, y, w, h, C_TEXT_MAIN);
-    M5Cardputer.Display.fillRect(x + w, y + 2, 2, 6, C_TEXT_MAIN);
-
-    // Determine Color
-    uint16_t color = C_PLAYING;
-    if (isCharging) color = C_ACCENT; // Cyan when charging
-    else if (batLevel < 20) color = TFT_RED;
-    else if (batLevel < 50) color = TFT_YELLOW;
-
-    // Draw Battery Fill
-    int fillW = map(batLevel, 0, 100, 0, w - 2);
-    if (fillW < 0) fillW = 0;
-    M5Cardputer.Display.fillRect(x + 1, y + 1, fillW, h - 2, color);
-
-    // --- FIXED: ONLY draw the bolt if charging ---
-    if (isCharging) {
-        // Top triangle
-        M5Cardputer.Display.fillTriangle(x + 14, y + 2, x + 8, y + 5, x + 14, y + 5, TFT_WHITE);
-        // Bottom triangle
-        M5Cardputer.Display.fillTriangle(x + 10, y + 5, x + 16, y + 5, x + 10, y + 8, TFT_WHITE);
-    }
-
-    // Draw Percentage Text
-    M5Cardputer.Display.setFont(&fonts::Font0);
-    M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
-    M5Cardputer.Display.setCursor(x - 25, y + 1); 
-    
-    if (batLevel == 100) M5Cardputer.Display.setCursor(x - 29, y + 1); 
-    
-    M5Cardputer.Display.print(batLevel);
-    M5Cardputer.Display.print("%");
-}
-
-// --- AUDIO CLASS ---
-class AudioOutputM5Speaker : public AudioOutput {
-  public:
-    AudioOutputM5Speaker(m5::Speaker_Class* m5sound, uint8_t virtual_sound_channel = 0) {
-      _m5sound = m5sound;
-      _virtual_ch = virtual_sound_channel;
-    }
-    virtual ~AudioOutputM5Speaker(void) {};
-    virtual bool begin(void) override { return true; }
-    virtual bool ConsumeSample(int16_t sample[2]) override {
-      if (_tri_buffer_index < tri_buf_size) {
-        _tri_buffer[_tri_index][_tri_buffer_index  ] = sample[0];
-        _tri_buffer[_tri_index][_tri_buffer_index+1] = sample[1];
-        _tri_buffer_index += 2;
-        return true;
-      }
-      flush();
-      return false;
-    }
-    virtual void flush(void) override {
-      if (_tri_buffer_index) {
-        _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, hertz, true, 1, _virtual_ch);
-        _tri_index = _tri_index < 2 ? _tri_index + 1 : 0;
-        _tri_buffer_index = 0;
-      }
-    }
-    virtual bool stop(void) override {
-      flush();
-      _m5sound->stop(_virtual_ch);
-      return true;
-    }
-    const int16_t* getBuffer(void) const { return _tri_buffer[(_tri_index + 2) % 3]; }
-  protected:
-    m5::Speaker_Class* _m5sound;
-    uint8_t _virtual_ch;
-    static constexpr size_t tri_buf_size = 2048;
-    int16_t _tri_buffer[3][tri_buf_size];
-    size_t _tri_buffer_index = 0;
-    size_t _tri_index = 0;
-};
-
-// --- FFT CLASS ---
+// ==========================================
+// HARDWARE CLASSES (FFT & SPEAKER)
+// ==========================================
 #define FFT_SIZE 256
 class fft_t {
-  float _wr[FFT_SIZE + 1]; float _wi[FFT_SIZE + 1];
-  float _fr[FFT_SIZE + 1]; float _fi[FFT_SIZE + 1];
+  float _wr[FFT_SIZE + 1], _wi[FFT_SIZE + 1], _fr[FFT_SIZE + 1], _fi[FFT_SIZE + 1];
   uint16_t _br[FFT_SIZE + 1]; size_t _ie;
 public:
   fft_t(void) {
@@ -864,1268 +159,858 @@ public:
     _ie = logf( (float)FFT_SIZE ) / log(2.0) + 0.5;
     static constexpr float omega = 2.0f * M_PI / FFT_SIZE;
     static constexpr int s4 = FFT_SIZE / 4; static constexpr int s2 = FFT_SIZE / 2;
-    for ( int i = 1 ; i < s4 ; ++i) {
-      float f = cosf(omega * i);
-      _wi[s4 + i] = f; _wi[s4 - i] = f;
-      _wr[     i] = f; _wr[s2 - i] = -f;
-    }
-    _wi[s4] = _wr[0] = 1;
-    size_t je = 1; _br[0] = 0; _br[1] = FFT_SIZE / 2;
-    for ( size_t i = 0 ; i < _ie - 1 ; ++i ) {
-      _br[ je << 1 ] = _br[ je ] >> 1; je = je << 1;
-      for ( size_t j = 1 ; j < je ; ++j ) _br[je + j] = _br[je] + _br[j];
-    }
+    for ( int i = 1 ; i < s4 ; ++i) { float f = cosf(omega * i); _wi[s4 + i] = f; _wi[s4 - i] = f; _wr[i] = f; _wr[s2 - i] = -f; }
+    _wi[s4] = _wr[0] = 1; size_t je = 1; _br[0] = 0; _br[1] = FFT_SIZE / 2;
+    for ( size_t i = 0 ; i < _ie - 1 ; ++i ) { _br[ je << 1 ] = _br[ je ] >> 1; je = je << 1; for ( size_t j = 1 ; j < je ; ++j ) _br[je + j] = _br[je] + _br[j]; }
   }
   void exec(const int16_t* in) {
     memset(_fi, 0, sizeof(_fi));
     for ( size_t j = 0 ; j < FFT_SIZE / 2 ; ++j ) {
       float basej = 0.25 * (1.0-_wr[j]); size_t r = FFT_SIZE - j - 1;
-      _fr[_br[j]] = basej * (in[j * 2] + in[j * 2 + 1]);
-      _fr[_br[r]] = basej * (in[r * 2] + in[r * 2 + 1]);
+      _fr[_br[j]] = basej * (in[j * 2] + in[j * 2 + 1]); _fr[_br[r]] = basej * (in[r * 2] + in[r * 2 + 1]);
     }
     size_t s = 1; size_t i = 0;
-    do {
-      size_t ke = s; s <<= 1; size_t je = FFT_SIZE / s; size_t j = 0;
-      do {
-        size_t k = 0;
-        do {
-          size_t l = s * j + k; size_t m = ke * (2 * j + 1) + k; size_t p = je * k;
-          float Wxmr = _fr[m] * _wr[p] + _fi[m] * _wi[p];
-          float Wxmi = _fi[m] * _wr[p] - _fr[m] * _wi[p];
-          _fr[m] = _fr[l] - Wxmr; _fi[m] = _fi[l] - Wxmi;
-          _fr[l] += Wxmr; _fi[l] += Wxmi;
-        } while ( ++k < ke) ;
+    do { size_t ke = s; s <<= 1; size_t je = FFT_SIZE / s; size_t j = 0;
+      do { size_t k = 0;
+        do { size_t l = s * j + k; size_t m = ke * (2 * j + 1) + k; size_t p = je * k;
+          float Wxmr = _fr[m] * _wr[p] + _fi[m] * _wi[p], Wxmi = _fi[m] * _wr[p] - _fr[m] * _wi[p];
+          _fr[m] = _fr[l] - Wxmr; _fi[m] = _fi[l] - Wxmi; _fr[l] += Wxmr; _fi[l] += Wxmi;
+        } while ( ++k < ke);
       } while ( ++j < je );
     } while ( ++i < _ie );
   }
-  uint32_t get(size_t index) {
-    return (index < FFT_SIZE / 2) ? (uint32_t)sqrtf(_fr[ index ] * _fr[ index ] + _fi[ index ] * _fi[ index ]) : 0u;
-  }
+  uint32_t get(size_t index) { return (index < FFT_SIZE / 2) ? (uint32_t)sqrtf(_fr[ index ] * _fr[ index ] + _fi[ index ] * _fi[ index ]) : 0u; }
+};
+
+class AudioOutputM5Speaker : public AudioOutput {
+  public:
+    AudioOutputM5Speaker(m5::Speaker_Class* m5sound, uint8_t virtual_sound_channel = 0) { _m5sound = m5sound; _virtual_ch = virtual_sound_channel; }
+    virtual ~AudioOutputM5Speaker(void) {};
+    virtual bool begin(void) override { return true; }
+    virtual bool ConsumeSample(int16_t sample[2]) override {
+      if (_tri_buffer_index < tri_buf_size) {
+        _tri_buffer[_tri_index][_tri_buffer_index] = sample[0]; _tri_buffer[_tri_index][_tri_buffer_index+1] = sample[1]; _tri_buffer_index += 2; return true;
+      }
+      flush(); return false;
+    }
+    virtual void flush(void) override {
+      if (_tri_buffer_index) { _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, hertz, true, 1, _virtual_ch); _tri_index = _tri_index < 2 ? _tri_index + 1 : 0; _tri_buffer_index = 0; }
+    }
+    virtual bool stop(void) override { flush(); _m5sound->stop(_virtual_ch); return true; }
+    const int16_t* getBuffer(void) const { return _tri_buffer[(_tri_index + 2) % 3]; }
+  protected:
+    m5::Speaker_Class* _m5sound; uint8_t _virtual_ch; static constexpr size_t tri_buf_size = 2048;
+    int16_t _tri_buffer[3][tri_buf_size]; size_t _tri_buffer_index = 0; size_t _tri_index = 0;
 };
 
 static constexpr size_t WAVE_SIZE = 320;
 static fft_t fft;
 static int16_t raw_data[WAVE_SIZE * 2];
+static AudioOutputM5Speaker *out = nullptr;
 
-
-
-// Helper function to read a single song path from the SD card using its offset
-String getSongPath(int index) {
-    if (index < 0 || index >= songOffsets.size()) return "";
-    File f = SD.open(PLAYLIST_FILE);
-    if (!f) return "";
-    f.seek(songOffsets[index]);            
-    String path = f.readStringUntil('\n'); 
-    f.close();
-
-    // Aggressively clean the string
-    path.trim(); 
-    
-    // The SD library demands paths start with a forward slash
-    if (path.length() > 0 && !path.startsWith("/")) {
-        path = "/" + path;
+// ==========================================
+// CONFIG MANAGER
+// ==========================================
+class ConfigManager {
+public:
+    static void load() {
+        preferences.begin("sam_music", true);
+        userSettings.brightness = preferences.getInt("brightness", 100);
+        userSettings.timeoutIndex = preferences.getInt("timeoutIndex", 0);
+        userSettings.resumePlay = preferences.getBool("resumePlay", true);
+        userSettings.spkRateIndex = preferences.getInt("spkRate", 4);
+        userSettings.lastIndex = preferences.getInt("lastIndex", 0);
+        userSettings.lastPos = preferences.getUInt("lastPos", 0);
+        userSettings.wifiEnabled = preferences.getBool("wifiEnabled", false);
+        userSettings.wifiSSID = preferences.getString("wifiSSID", "");
+        userSettings.wifiPass = preferences.getString("wifiPass", "");
+        userSettings.isAPMode = preferences.getBool("isAPMode", false);
+        userSettings.apSSID = preferences.getString("apSSID", "Cardputer");
+        userSettings.apPass = preferences.getString("apPass", "12345678");
+        userSettings.powerSaverMode = preferences.getInt("powerMode", 0);
+        userSettings.themeIndex = preferences.getInt("themeIndex", 0);
+        preferences.end();
+        
+        if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
+        if(userSettings.apPass.length() < 8) userSettings.apPass = "12345678";
     }
-    
-    return path;
-}
 
-// Builds the RAM index of file offsets so we can seek() quickly later
-bool loadPlaylist() {
-    songOffsets.clear();
-    if (!SD.exists(PLAYLIST_FILE)) return false;
-    File file = SD.open(PLAYLIST_FILE);
-    if (!file) return false;
+    static void save(uint32_t currentPos = 0, int currentIndex = 0) {
+        if(currentPos > 0) { userSettings.lastPos = currentPos; userSettings.lastIndex = currentIndex; }
+        preferences.begin("sam_music", false);
+        preferences.putInt("brightness", userSettings.brightness);
+        preferences.putInt("timeoutIndex", userSettings.timeoutIndex);
+        preferences.putBool("resumePlay", userSettings.resumePlay);
+        preferences.putInt("spkRate", userSettings.spkRateIndex);
+        preferences.putInt("lastIndex", userSettings.lastIndex);
+        preferences.putUInt("lastPos", userSettings.lastPos);
+        preferences.putBool("wifiEnabled", userSettings.wifiEnabled);
+        preferences.putString("wifiSSID", userSettings.wifiSSID);
+        preferences.putString("wifiPass", userSettings.wifiPass);
+        preferences.putBool("isAPMode", userSettings.isAPMode);
+        preferences.putString("apSSID", userSettings.apSSID);
+        preferences.putString("apPass", userSettings.apPass);
+        preferences.putInt("powerMode", userSettings.powerSaverMode);
+        preferences.putInt("themeIndex", userSettings.themeIndex);
+        preferences.end();
+    }
 
-    while (file.available()) {
-        // 1. Grab the offset BEFORE we read the line
-        uint32_t pos = file.position(); 
-        
-        // 2. Read the line
-        String line = file.readStringUntil('\n');
-        line.trim(); // Clean up hidden carriage returns
-        
-        // 3. ONLY save the offset if it's an actual audio file
-        String lineLower = line;
-        lineLower.toLowerCase();
-        if (lineLower.length() > 0 && (lineLower.endsWith(".mp3") || lineLower.endsWith(".flac") || lineLower.endsWith(".m4a") || lineLower.endsWith(".aac")) || lineLower.endsWith(".wav")) {
-            songOffsets.push_back(pos);
+    static void exportToSD() {
+        if (SD.exists(CONFIG_FILE)) SD.remove(CONFIG_FILE);
+        File file = SD.open(CONFIG_FILE, FILE_WRITE);
+        if (file) {
+            file.println(userSettings.brightness); file.println(userSettings.timeoutIndex);
+            file.println(userSettings.resumePlay ? 1 : 0); file.println(userSettings.spkRateIndex);
+            file.println(userSettings.lastIndex); file.println(userSettings.lastPos);
+            file.println(userSettings.wifiEnabled ? 1 : 0); file.println(userSettings.wifiSSID);
+            file.println(userSettings.wifiPass); file.println(userSettings.isAPMode ? 1 : 0);
+            file.println(userSettings.apSSID); file.println(userSettings.apPass);
+            file.println(userSettings.powerSaverMode); file.close();
+            
+            M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
+            M5Cardputer.Display.setTextColor(C_PLAYING); M5Cardputer.Display.print("Exported to SD!"); delay(1000);
         }
     }
-    file.close();
-    return (songOffsets.size() > 0);
-}
 
-// Pass the open File object so it can write directly without using RAM
-void listDir(fs::FS &fs, const char *dirname, uint8_t levels, File &playlistFile) {
-    if(stop_scan) return;
-    File root = fs.open(dirname);
-    if (!root || !root.isDirectory()) return;
-
-    File file = root.openNextFile();
-    while (file) {
-        if(stop_scan) return;
-        if (file.isDirectory()) {
-            if (levels) listDir(fs, file.path(), levels - 1, playlistFile);
-        } else {
-            String filename = file.name();
-            String filepath = file.path();
-            String filenameLower = filename;
-            filenameLower.toLowerCase();
-            if (filenameLower.endsWith(".mp3") || filenameLower.endsWith(".flac") || filenameLower.endsWith(".m4a") || filenameLower.endsWith(".aac") || filenameLower.endsWith(".wav")) {
-                playlistFile.println(filepath); // Write directly to SD
-                
-                // Keep the UI updated
-                M5Cardputer.Display.fillScreen(C_BG_DARK);
-                M5Cardputer.Display.setCursor(10, 40);
-                M5Cardputer.Display.println("Scanning...");
-                M5Cardputer.Display.setTextColor(C_ACCENT);
-                M5Cardputer.Display.println(filename);
-                M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-            }
+    static void importFromSD() {
+        if (!SD.exists(CONFIG_FILE)) {
+            M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
+            M5Cardputer.Display.setTextColor(TFT_RED); M5Cardputer.Display.print("No config.txt found!"); delay(1000); return;
         }
-        file = root.openNextFile();
-    }
-}
-
-void performFullScan() {
-    stop_scan = false;
-    songOffsets.clear();
-    M5Cardputer.Display.fillScreen(C_BG_DARK);
-    M5Cardputer.Display.setCursor(10, 40);
-    M5Cardputer.Display.println("Scanning SD Card...");
-    
-    // Clear old playlist and open for writing
-    if (SD.exists(PLAYLIST_FILE)) SD.remove(PLAYLIST_FILE);
-    File playlistFile = SD.open(PLAYLIST_FILE, FILE_WRITE);
-    
-    // Scan and write
-    if (playlistFile) {
-        listDir(SD, "/", 3, playlistFile);
-        playlistFile.close();
-    }
-    
-    // Build the offset index from the newly created file
-    loadPlaylist(); 
-}
-
-// --- DRAWING FUNCTIONS ---
-void drawPlaylist() {
-  M5Cardputer.Display.setFont(&fonts::Font0);
-  int totalSongs = songOffsets.size();
-  
-  int halfPage = MAX_VISIBLE_ROWS / 2;
-  int startIdx = browserIndex - halfPage;
-  if (startIdx < 0) startIdx = 0;
-  if (startIdx > totalSongs - MAX_VISIBLE_ROWS) startIdx = totalSongs - MAX_VISIBLE_ROWS;
-  if (startIdx < 0) startIdx = 0;
-
-  int yPos = HEADER_HEIGHT + 2;
-  int xPos = 0;
-  
-  M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, PLAYLIST_WIDTH, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_LIGHT);
-  M5Cardputer.Display.drawFastVLine(PLAYLIST_WIDTH, HEADER_HEIGHT, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_DARK);
-
-  // OPEN FILE AND JUMP TO THE FIRST VISIBLE ROW
-  File f = SD.open(PLAYLIST_FILE);
-  if (f && totalSongs > 0) {
-      f.seek(songOffsets[startIdx]);
-  }
-
-  for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
-    int actualIdx = startIdx + i;
-    if (actualIdx >= totalSongs) break;
-
-    if (actualIdx == browserIndex) {
-      M5Cardputer.Display.fillRect(xPos + 2, yPos, PLAYLIST_WIDTH - 6, ROW_HEIGHT, C_ACCENT); 
-      M5Cardputer.Display.setTextColor(C_BG_DARK);
-    } 
-    else if (actualIdx == currentFileIndex) {
-      M5Cardputer.Display.setTextColor(C_PLAYING); 
-    } else {
-      M5Cardputer.Display.setTextColor(C_TEXT_DIM);
-    }
-
-    // READ NEXT LINE FROM SD CARD
-    String dispName = "";
-    if (f) {
-        dispName = f.readStringUntil('\n');
-        dispName.trim();
-    }
-    
-    int slashIdx = dispName.lastIndexOf('/');
-    if(slashIdx >= 0) dispName = dispName.substring(slashIdx+1);
-
-    M5Cardputer.Display.setCursor(xPos + 5, yPos + 3);
-    if (actualIdx == currentFileIndex) M5Cardputer.Display.print("> ");
-    M5Cardputer.Display.print(dispName.substring(0, 16)); 
-    yPos += ROW_HEIGHT;
-  }
-  if (f) f.close();
-}
-
-void drawBottomBar() {
-    int yPos = M5Cardputer.Display.height() - BOTTOM_BAR_HEIGHT;
-    
-    // Draw the base bottom bar background
-    M5Cardputer.Display.fillRect(0, yPos, M5Cardputer.Display.width(), BOTTOM_BAR_HEIGHT, C_HEADER);
-    
-    // Draw the instructions
-    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.setFont(&fonts::Font0);
-    M5Cardputer.Display.setCursor(5, yPos + 4);
-    M5Cardputer.Display.print("Enter:Play  ;/.:Scroll  I:info");
-
-    // --- NEW: Dynamic Codec Badge ---
-    if (songOffsets.size() > 0) {
-        String fname = getSongPath(currentFileIndex);
-        fname.toLowerCase();
-        
-        String codecText = "MP3";
-        uint16_t codecColor = C_ACCENT; // Cyan for MP3
-        
-        if (fname.endsWith(".flac")) {
-            codecText = "FLAC";
-            codecColor = C_PLAYING;     // Green for FLAC (Lossless!)
-        } else if (fname.endsWith(".m4a") || fname.endsWith(".aac")) {
-            codecText = "AAC";
-            codecColor = C_HIGHLIGHT;   // Magenta for AAC
-        }else if (fname.endsWith(".wav")) {
-            codecText = "WAV";
-            codecColor = TFT_ORANGE;    // Orange for WAV
+        File file = SD.open(CONFIG_FILE);
+        if (file) {
+            if(file.available()) userSettings.brightness = file.readStringUntil('\n').toInt();
+            if(file.available()) userSettings.timeoutIndex = file.readStringUntil('\n').toInt();
+            if(file.available()) userSettings.resumePlay = (file.readStringUntil('\n').toInt() == 1);
+            if(file.available()) userSettings.spkRateIndex = file.readStringUntil('\n').toInt();
+            if(file.available()) userSettings.lastIndex = file.readStringUntil('\n').toInt();
+            if(file.available()) userSettings.lastPos = file.readStringUntil('\n').toInt();
+            if(file.available()) userSettings.wifiEnabled = (file.readStringUntil('\n').toInt() == 1);
+            if(file.available()) { userSettings.wifiSSID = file.readStringUntil('\n'); userSettings.wifiSSID.trim(); }
+            if(file.available()) { userSettings.wifiPass = file.readStringUntil('\n'); userSettings.wifiPass.trim(); }
+            if(file.available()) userSettings.isAPMode = (file.readStringUntil('\n').toInt() == 1);
+            if(file.available()) { userSettings.apSSID = file.readStringUntil('\n'); userSettings.apSSID.trim(); }
+            if(file.available()) { userSettings.apPass = file.readStringUntil('\n'); userSettings.apPass.trim(); }
+            if(file.available()) userSettings.powerSaverMode = file.readStringUntil('\n').toInt();
+            file.close();
+            save(); M5Cardputer.Display.setBrightness(userSettings.brightness);
+            M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
+            M5Cardputer.Display.setTextColor(C_PLAYING); M5Cardputer.Display.print("Imported from SD!"); delay(1000);
         }
-
-        // Badge Dimensions and Positioning
-        int boxW = 36;
-        int boxH = 14;
-        int boxX = M5Cardputer.Display.width() - boxW - 2; // 2px margin from the right edge
-        int boxY = yPos + 2;                               // Centered vertically in the 18px bar
-
-        // Draw the badge background
-        M5Cardputer.Display.fillRoundRect(boxX, boxY, boxW, boxH, 3, codecColor);
-        
-        // Draw the dark text inside the badge
-        M5Cardputer.Display.setTextColor(C_BG_DARK); 
-        
-        // Center the text dynamically based on the string length
-        int textWidth = M5Cardputer.Display.textWidth(codecText.c_str());
-        int textX = boxX + ((boxW - textWidth) / 2);
-        
-        M5Cardputer.Display.setCursor(textX, boxY + 3);
-        M5Cardputer.Display.print(codecText);
     }
-}
-
-int lastProgressWidth = -1;
-void drawProgressBar(bool force = false) {
-    if (!id3 || !file) return;
-    int xStart = PLAYLIST_WIDTH + 10;
-    int yStart = HEADER_HEIGHT + 35;
-    int maxWidth = M5Cardputer.Display.width() - xStart - 10; // Dynamic Width
-    int height = 3;
-
-    uint32_t currentPos = id3->getPos();
-    uint32_t totalSize = id3->getSize();
-    if (totalSize == 0) return;
-
-    int currentWidth = (int)((float)currentPos / (float)totalSize * maxWidth);
-    if (currentWidth > maxWidth) currentWidth = maxWidth;
-
-    if (force || currentWidth != lastProgressWidth) {
-        M5Cardputer.Display.fillRect(xStart-3, yStart-3, maxWidth+6, height+6, C_BG_DARK );
-        M5Cardputer.Display.fillRect(xStart, yStart, maxWidth, height, C_BG_LIGHT);
-        M5Cardputer.Display.fillRect(xStart, yStart, currentWidth, height, C_HIGHLIGHT);
-        M5Cardputer.Display.fillCircle(xStart + currentWidth, yStart + 1, 3, C_TEXT_MAIN);
-        lastProgressWidth = currentWidth;
-    }
-}
-
-void drawNowPlayingInfo() {
-  int xStart = PLAYLIST_WIDTH + 5;
-  int yStart = HEADER_HEIGHT + 5;
-  int w = M5Cardputer.Display.width() - xStart;
-
-  M5Cardputer.Display.fillRect(xStart, yStart, w, 50, C_BG_DARK);
-  
-  M5Cardputer.Display.setFont(&fonts::lgfxJapanGothic_12);
-  M5Cardputer.Display.setTextColor(isPaused ? TFT_ORANGE : C_PLAYING);
-  M5Cardputer.Display.setCursor(xStart + 5, yStart);
-  M5Cardputer.Display.print(isPaused ? "[ PAUSED ]" : "PLAYING >");
-
-  int iconX = M5Cardputer.Display.width() - 55;
-  M5Cardputer.Display.setCursor(iconX, yStart);
-
-  if (isShuffle) { M5Cardputer.Display.setTextColor(C_HIGHLIGHT); M5Cardputer.Display.print("SHF "); }
-  else { M5Cardputer.Display.setTextColor(C_BG_LIGHT); M5Cardputer.Display.print("___ "); }
-
-  switch(loopMode) {
-    case NO_LOOP: M5Cardputer.Display.setTextColor(C_BG_LIGHT); M5Cardputer.Display.print("1X"); break;
-    case LOOP_ALL: M5Cardputer.Display.setTextColor(C_ACCENT); M5Cardputer.Display.print("ALL"); break;
-    case LOOP_ONE: M5Cardputer.Display.setTextColor(C_HIGHLIGHT); M5Cardputer.Display.print("ONE"); break;
-  }
-
-  M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-  M5Cardputer.Display.setCursor(xStart + 5, yStart + 16);
-  if (currentTitle.length() > 0) {
-    M5Cardputer.Display.print(currentTitle.substring(0, 15));
-  } 
-  drawProgressBar(true);
-  
-  int vol = M5Cardputer.Speaker.getVolume();
-  int volY = yStart + 42;
-  M5Cardputer.Display.setCursor(xStart + 5, volY);
-  M5Cardputer.Display.setFont(&fonts::Font0);
-  M5Cardputer.Display.setTextColor(C_ACCENT);
-  M5Cardputer.Display.print("VOL ");
-  
-  int maxVolW = 60;
-  M5Cardputer.Display.drawRect(xStart + 30, volY, maxVolW, 6, C_BG_LIGHT);
-  int volFill = (vol * (maxVolW-2)) / 255;
-  M5Cardputer.Display.fillRect(xStart + 31, volY + 1, volFill, 4, C_ACCENT);
-}
-
-void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string) {
-  (void)cbData;
-  if (string[0] == 0) return;
-  if (strcmp(type, "Title") == 0) {
-    currentTitle = String(string);
-    drawNowPlayingInfo();
-  } else if (strcmp(type, "Artist") == 0) {
-    currentArtist = String(string);
-  }
-}
-
-
-  void drawVisualizer() {
-  if (!decoder || !decoder->isRunning() || isPaused) return;
-  auto buf = out->getBuffer();
-  if (buf) {
-    memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t));
-    fft.exec(raw_data);
-
-    visSprite.fillScreen(C_BG_DARK);
-    int visW = visSprite.width();
-    int visH = visSprite.height();
-    int barWidth = 4;
-    int numBars = visW / barWidth;
-    if (numBars > FFT_SIZE / 2) numBars = FFT_SIZE / 2;
-
-    for (size_t bx = 0; bx < numBars; ++bx) {
-      int x = (bx * barWidth);
-      int32_t f = fft.get(bx);
-      int32_t barH = (f * visH) >> 16;
-      if (barH > visH) barH = visH;
-      int yTop = visH - barH;
-      
-      uint16_t barColor;
-      if (barH < visH * 0.4) barColor = C_ACCENT;      
-      else if (barH < visH * 0.7) barColor = C_HIGHLIGHT; 
-      else barColor = TFT_RED;                         
-      
-      visSprite.fillRect(x, yTop, barWidth - 1, barH, barColor);
-    }
-    visSprite.pushSprite(PLAYLIST_WIDTH + 2, HEADER_HEIGHT + 55);
-  }
-}
-
-// --- POPUPS ---
-// UPDATED HELP TEXT
-const std::vector<String> helpLines = {
-  "--- MUSIC PLAYER ---",
-  "Enter: Play / Pause", 
-  "; / . : Scroll / Navigate",
-  "[ / ] : Volume - / +",
-  "N / B : Next / Prev Song",
-  "/ / , : Seek +5s / -5s",
-  "S: Shuffle   L: Loop Mode", 
-  "Esc: Settings  V: Visualizer",
-  "I: Close Help",
-  "--- SMART FEATURES ---",
-  "Web UI: Enable Wi-Fi in",
-  "settings to access .",
-  "Power Saver: Underclock",
-  "CPU to save battery life.",
-  "--- POCKET MODE ---",
-  "Btn A (1 Click): Play/Pause",
-  "Btn A (2 Clicks): Next",
-  "Btn A (3 Clicks): Prev",
-  "Press any key to wake screen",
-  "---",
-  "GH: github.com/sanchitminda",
-  "Share your suggestions!"
 };
 
-void drawHelpPopup() {
-    int px = 15; int py = 25; int pw = 210; int ph = 100;
-    M5Cardputer.Display.fillRoundRect(px, py, pw, ph, 4, C_BG_LIGHT);
-    M5Cardputer.Display.drawRoundRect(px, py, pw, ph, 4, C_ACCENT);
-    M5Cardputer.Display.setFont(&fonts::Font0);
-    M5Cardputer.Display.setTextColor(C_ACCENT);
-    M5Cardputer.Display.setCursor(px + 10, py + 5);
-    M5Cardputer.Display.print("-- CONTROLS --");
-
-    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    int contentY = py + 20;
-    int lineHeight = 10;
-    int visibleLines = 6; // Increased visible lines
-
-    for (int i = 0; i < visibleLines; i++) {
-        int idx = helpScrollOffset + i;
-        if (idx >= helpLines.size()) break;
-        M5Cardputer.Display.setCursor(px + 10, contentY + (i * lineHeight));
-        M5Cardputer.Display.print(helpLines[idx]);
-    }
+void applyCpuFrequency() {
+    if (userSettings.wifiEnabled || userSettings.powerSaverMode == 0) setCpuFrequencyMhz(240); 
+    else if (userSettings.powerSaverMode == 1) setCpuFrequencyMhz(160); 
+    else setCpuFrequencyMhz(80); 
 }
-void drawSettingsMenu() {
-    int px = 20; int py = 15; int pw = 200; int ph = 135;
-    const char* powerModeLabels[] = { "OFF", "BASIC (160)", "ULTRA (80)" };
-    M5Cardputer.Display.fillRoundRect(px, py, pw, ph, 4, C_BG_LIGHT);
-    M5Cardputer.Display.drawRoundRect(px, py, pw, ph, 4, C_ACCENT);
-    
-    // Header
-    M5Cardputer.Display.setFont(&fonts::Font0);
-    M5Cardputer.Display.fillRoundRect(px+2, py+2, pw-4, 18, 2, C_HEADER);
-    M5Cardputer.Display.setCursor(px + 8, py + 5);
-    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-    M5Cardputer.Display.print("SETTINGS");
 
-    String totalText = String(songOffsets.size()) + " Songs";
-    int textWidth = M5Cardputer.Display.textWidth(totalText.c_str());
-    M5Cardputer.Display.setCursor(px + pw - textWidth - 8, py + 5);
-    M5Cardputer.Display.print(totalText);
+// ==========================================
+// AUDIO ENGINE
+// ==========================================
+class AudioEngine {
+public:
+    AudioFileSourceSD *file = nullptr;
+    AudioFileSourceID3 *id3 = nullptr;
+    AudioFileSourceBuffer *buff = nullptr; 
+    AudioGenerator *decoder = nullptr;
 
-    int startY = py + 30;
-    int gap = 20;
+    std::vector<uint32_t> songOffsets;
+    int currentIndex = 0;
+    int browserIndex = 0;
+    bool isPaused = false;
+    bool isShuffle = false;
+    LoopState loopMode = NO_LOOP;
+    uint32_t paused_at = 0;
+    String currentTitle = "";
+    String currentArtist = "";
 
-    // --- NEW: Draw only the visible rows ---
-    for (int i = 0; i < MAX_MENU_ROWS; i++) {
-        int idx = menuScrollOffset + i;
-        if (idx >= TOTAL_SETTINGS) break;
+    void listDir(fs::FS &fs, const char *dirname, uint8_t levels, File &playlistFile) {
+        File root = fs.open(dirname); if (!root || !root.isDirectory()) return;
+        File file = root.openNextFile();
+        while (file) {
+            if (file.isDirectory()) { if (levels) listDir(fs, file.path(), levels - 1, playlistFile); } 
+            else {
+                String filename = file.name(); String filepath = file.path();
+                String filenameLower = filename; filenameLower.toLowerCase();
+                if (filenameLower.endsWith(".mp3") || filenameLower.endsWith(".flac") || filenameLower.endsWith(".m4a") || filenameLower.endsWith(".aac") || filenameLower.endsWith(".wav")) {
+                    playlistFile.println(filepath);
+                    M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
+                    M5Cardputer.Display.println("Scanning..."); M5Cardputer.Display.setTextColor(C_ACCENT);
+                    M5Cardputer.Display.println(filename); M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+                }
+            }
+            file = root.openNextFile();
+        }
+    }
 
-        M5Cardputer.Display.setCursor(px + 15, startY + (i * gap));
+    void performFullScan() {
+        stop(); songOffsets.clear();
+        M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40); M5Cardputer.Display.println("Scanning SD Card...");
+        if (SD.exists(PLAYLIST_FILE)) SD.remove(PLAYLIST_FILE);
+        File playlistFile = SD.open(PLAYLIST_FILE, FILE_WRITE);
+        if (playlistFile) { listDir(SD, "/", 3, playlistFile); playlistFile.close(); }
+        loadPlaylist();
+    }
+
+    bool loadPlaylist() {
+        songOffsets.clear();
+        if (!SD.exists(PLAYLIST_FILE)) return false;
+        File f = SD.open(PLAYLIST_FILE);
+        if (!f) return false;
+        while (f.available()) {
+            uint32_t pos = f.position(); 
+            String line = f.readStringUntil('\n'); line.trim(); line.toLowerCase();
+            if (line.endsWith(".mp3") || line.endsWith(".flac") || line.endsWith(".m4a") || line.endsWith(".aac") || line.endsWith(".wav")) { songOffsets.push_back(pos); }
+        }
+        f.close(); return (songOffsets.size() > 0);
+    }
+
+    String getSongPath(int index) {
+        if (index < 0 || index >= songOffsets.size()) return "";
+        File f = SD.open(PLAYLIST_FILE); f.seek(songOffsets[index]); String path = f.readStringUntil('\n'); f.close();
+        path.trim(); if (path.length() > 0 && !path.startsWith("/")) path = "/" + path;
+        return path;
+    }
+
+    void stop() {
+        if (decoder) { decoder->stop(); delete decoder; decoder = nullptr; }
+        if (id3) { id3->close(); delete id3; id3 = nullptr; }
+        if (buff) { buff->close(); delete buff; buff = nullptr; }
+        if (file) { file->close(); delete file; file = nullptr; }
+    }
+
+    static void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string);
+
+    bool play(int index, uint32_t startPos = 0) {
+        stop(); if (songOffsets.empty()) return false;
+        currentIndex = index; browserIndex = index; currentTitle = ""; currentArtist = "";
+        String fname = getSongPath(currentIndex);
+
+        file = new AudioFileSourceSD(fname.c_str());
+        buff = new AudioFileSourceBuffer(file, 16384); 
+        id3 = new AudioFileSourceID3(buff); 
+        id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
         
-        // Highlight logic
-        if (idx == settingsCursor) {
-            M5Cardputer.Display.setTextColor(idx == 4 ? TFT_RED : C_HIGHLIGHT); 
-        } else {
-            M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+        if (startPos > 0) id3->seek(startPos, 1);
+        String fnameLower = fname; fnameLower.toLowerCase();
+        if (fnameLower.endsWith(".flac")) decoder = new AudioGeneratorFLAC();
+        else if (fnameLower.endsWith(".m4a") || fnameLower.endsWith(".aac")) decoder = new AudioGeneratorAAC();
+        else if (fnameLower.endsWith(".wav")) decoder = new AudioGeneratorWAV();
+        else decoder = new AudioGeneratorMP3();
+        
+        isPaused = false; return decoder->begin(id3, out);
+    }
+
+    void togglePause() {
+        if (!decoder) return;
+        if (decoder->isRunning()) { paused_at = id3->getPos(); decoder->stop(); isPaused = true; } 
+        else if (isPaused) { play(currentIndex, paused_at); }
+    }
+
+    void seek(int seconds) {
+        if (!decoder || !decoder->isRunning() || !id3) return;
+        int32_t newPos = id3->getPos() + (seconds * 16000);
+        if (newPos < 0) newPos = 0; if (newPos > id3->getSize()) newPos = id3->getSize() - 1000;
+        play(currentIndex, newPos);
+    }
+
+    void next(bool autoPlay = false) {
+        if (songOffsets.empty()) return;
+        if (autoPlay && loopMode == LOOP_ONE) { play(currentIndex); return; }
+        if (isShuffle) currentIndex = random(0, songOffsets.size());
+        else {
+            currentIndex++;
+            if (currentIndex >= songOffsets.size()) { if (loopMode == LOOP_ALL) currentIndex = 0; else { stop(); currentIndex = 0; return; } }
+        }
+        play(currentIndex);
+    }
+
+    void prev() {
+        if (songOffsets.empty()) return;
+        if (isShuffle) currentIndex = random(0, songOffsets.size());
+        else { currentIndex--; if (currentIndex < 0) currentIndex = songOffsets.size() - 1; }
+        play(currentIndex);
+    }
+
+    void loopTasks() {
+        if (decoder && decoder->isRunning()) {
+            if (!decoder->loop()) { decoder->stop(); next(true); if(userSettings.resumePlay) ConfigManager::save(id3 ? id3->getPos() : 0, currentIndex); }
+        }
+    }
+};
+
+AudioEngine audioApp;
+
+// ==========================================
+// UI MANAGER
+// ==========================================
+class UIManager {
+public:
+    static int settingsCursor;
+    static int menuScrollOffset;
+    static bool showVisualizer;
+    static int wifiCursor;
+    static int wifiScrollOffset;
+    static int wifiNetworkCount;
+    static int helpScrollOffset; // Add this with the other static ints
+
+    static void drawHelp() {
+        drawPopup("CONTROLS & HELP", "Press 'I' to Exit");
+        int px = 15, py = 15;
+        int contentY = py + 25;
+        int lineHeight = 12;
+        int visibleLines = 7; // How many lines fit in the box at once
+
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+
+        for (int i = 0; i < visibleLines; i++) {
+            int idx = helpScrollOffset + i;
+            if (idx >= numHelpLines) break;
+            M5Cardputer.Display.setCursor(px + 10, contentY + (i * lineHeight));
+            M5Cardputer.Display.print(helpLines[idx]);
+        }
+        
+        // Draw little scroll indicators
+        M5Cardputer.Display.setTextColor(C_ACCENT);
+        if (helpScrollOffset > 0) M5Cardputer.Display.drawString("^", px + 190, contentY);
+        if (helpScrollOffset < numHelpLines - visibleLines) M5Cardputer.Display.drawString("v", px + 190, contentY + (visibleLines * lineHeight) - 10);
+    }
+
+    static void drawPopup(const char* title, const char* footer) {
+        int px = 15, py = 15, pw = 210, ph = 120;
+        M5Cardputer.Display.fillRoundRect(px, py, pw, ph, 4, C_BG_LIGHT); M5Cardputer.Display.drawRoundRect(px, py, pw, ph, 4, C_ACCENT);
+        M5Cardputer.Display.fillRoundRect(px+2, py+2, pw-4, 18, 2, C_HEADER); M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN); M5Cardputer.Display.setCursor(px + 8, py + 5); M5Cardputer.Display.print(title);
+        if (footer) { M5Cardputer.Display.setCursor(px + 10, py + ph - 15); M5Cardputer.Display.setTextColor(C_TEXT_DIM); M5Cardputer.Display.print(footer); }
+    }
+
+    static void drawHeader() {
+        M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
+        M5Cardputer.Display.setFont(&fonts::Font0); 
+        String prefix = "Music Player";
+        if (userSettings.wifiEnabled) {
+            if (userSettings.isAPMode) { prefix = WiFi.softAPIP().toString(); M5Cardputer.Display.setTextColor(TFT_ORANGE, C_HEADER); } 
+            else if (WiFi.status() == WL_CONNECTED) { prefix = WiFi.localIP().toString(); M5Cardputer.Display.setTextColor(C_ACCENT, C_HEADER); } 
+            else M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
+        } else M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
+        
+        String headerText = prefix + " [" + String(audioApp.currentIndex + 1) + "/" + String(audioApp.songOffsets.size()) + "]";
+        M5Cardputer.Display.drawString(headerText.c_str(), 5, 5); 
+        drawBattery();
+    }
+
+    static void drawBattery() {
+        int batLevel = M5Cardputer.Power.getBatteryLevel();
+        int w = 24, h = 10, x = M5Cardputer.Display.width() - w - 5, y = 5;
+
+        // Clear the background area for the battery icon
+        M5Cardputer.Display.fillRect(x - 30, 0, w + 35, HEADER_HEIGHT, C_HEADER); 
+
+        // Draw Battery Outline
+        M5Cardputer.Display.drawRect(x, y, w, h, C_TEXT_MAIN); 
+        M5Cardputer.Display.fillRect(x + w, y + 2, 2, 6, C_TEXT_MAIN);
+
+        // Determine Color based purely on Percentage
+        uint16_t color = batLevel < 20 ? TFT_RED : (batLevel < 50 ? TFT_YELLOW : C_PLAYING);
+        
+        // Draw Battery Fill
+        int fillW = max(0, (int)map(batLevel, 0, 100, 0, w - 2));
+        M5Cardputer.Display.fillRect(x + 1, y + 1, fillW, h - 2, color);
+
+        // Draw Percentage Text
+        M5Cardputer.Display.setFont(&fonts::Font0); 
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
+        M5Cardputer.Display.setCursor(batLevel == 100 ? x - 29 : x - 25, y + 1); 
+        M5Cardputer.Display.print(batLevel); 
+        M5Cardputer.Display.print("%");
+    }
+
+    static void drawBottomBar() {
+        int yPos = M5Cardputer.Display.height() - BOTTOM_BAR_HEIGHT;
+        M5Cardputer.Display.fillRect(0, yPos, M5Cardputer.Display.width(), BOTTOM_BAR_HEIGHT, C_HEADER);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN); M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setCursor(5, yPos + 4); M5Cardputer.Display.print("Enter:Play  ;/.:Scroll  I:info");
+
+        if (!audioApp.songOffsets.empty()) {
+            String fname = audioApp.getSongPath(audioApp.currentIndex); fname.toLowerCase();
+            String codecText = "MP3"; uint16_t codecColor = C_ACCENT;
+            if (fname.endsWith(".flac")) { codecText = "FLAC"; codecColor = C_PLAYING; }
+            else if (fname.endsWith(".m4a") || fname.endsWith(".aac")) { codecText = "AAC"; codecColor = C_HIGHLIGHT; }
+            else if (fname.endsWith(".wav")) { codecText = "WAV"; codecColor = TFT_ORANGE; }
+
+            int boxW = 36, boxH = 14, boxX = M5Cardputer.Display.width() - boxW - 2, boxY = yPos + 2; 
+            M5Cardputer.Display.fillRoundRect(boxX, boxY, boxW, boxH, 3, codecColor); M5Cardputer.Display.setTextColor(C_BG_DARK); 
+            M5Cardputer.Display.setCursor(boxX + ((boxW - M5Cardputer.Display.textWidth(codecText.c_str())) / 2), boxY + 3);
+            M5Cardputer.Display.print(codecText);
+        }
+    }
+
+    static void drawPlaylist() {
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        int totalSongs = audioApp.songOffsets.size();
+        int startIdx = max(0, min(audioApp.browserIndex - (MAX_VISIBLE_ROWS / 2), totalSongs - MAX_VISIBLE_ROWS));
+        int yPos = HEADER_HEIGHT + 2, xPos = 0;
+        M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, PLAYLIST_WIDTH, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_LIGHT);
+        M5Cardputer.Display.drawFastVLine(PLAYLIST_WIDTH, HEADER_HEIGHT, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_DARK);
+
+        File f = SD.open(PLAYLIST_FILE); if (f && totalSongs > 0) f.seek(audioApp.songOffsets[startIdx]);
+
+        for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
+            int actualIdx = startIdx + i; if (actualIdx >= totalSongs) break;
+
+            if (actualIdx == audioApp.browserIndex) { M5Cardputer.Display.fillRect(xPos + 2, yPos, PLAYLIST_WIDTH - 6, ROW_HEIGHT, C_ACCENT); M5Cardputer.Display.setTextColor(C_BG_DARK); } 
+            else if (actualIdx == audioApp.currentIndex) M5Cardputer.Display.setTextColor(C_PLAYING); 
+            else M5Cardputer.Display.setTextColor(C_TEXT_DIM);
+
+            String dispName = f ? f.readStringUntil('\n') : ""; dispName.trim();
+            int slashIdx = dispName.lastIndexOf('/'); if(slashIdx >= 0) dispName = dispName.substring(slashIdx+1);
+
+            M5Cardputer.Display.setCursor(xPos + 5, yPos + 3);
+            if (actualIdx == audioApp.currentIndex) M5Cardputer.Display.print("> ");
+            M5Cardputer.Display.print(dispName.substring(0, 16)); yPos += ROW_HEIGHT;
+        }
+        if (f) f.close();
+    }
+
+    static void drawNowPlaying() {
+        int xStart = PLAYLIST_WIDTH + 5, yStart = HEADER_HEIGHT + 5;
+        M5Cardputer.Display.fillRect(xStart, yStart, M5Cardputer.Display.width() - xStart, 50, C_BG_DARK);
+        
+        M5Cardputer.Display.setFont(&fonts::lgfxJapanGothic_12); M5Cardputer.Display.setTextColor(audioApp.isPaused ? TFT_ORANGE : C_PLAYING);
+        M5Cardputer.Display.setCursor(xStart + 5, yStart); M5Cardputer.Display.print(audioApp.isPaused ? "[PAUSED]" : "PLAYING >");
+
+        M5Cardputer.Display.setCursor(M5Cardputer.Display.width() - 55, yStart);
+        if (audioApp.isShuffle) { M5Cardputer.Display.setTextColor(C_HIGHLIGHT); M5Cardputer.Display.print("SHF "); } else { M5Cardputer.Display.setTextColor(C_BG_LIGHT); M5Cardputer.Display.print("___ "); }
+
+        switch(audioApp.loopMode) {
+            case NO_LOOP: M5Cardputer.Display.setTextColor(C_BG_LIGHT); M5Cardputer.Display.print("1X"); break;
+            case LOOP_ALL: M5Cardputer.Display.setTextColor(C_ACCENT); M5Cardputer.Display.print("ALL"); break;
+            case LOOP_ONE: M5Cardputer.Display.setTextColor(C_HIGHLIGHT); M5Cardputer.Display.print("ONE"); break;
         }
 
-        // Content logic
-// Content logic
-        switch (idx) {
-            case 0: M5Cardputer.Display.printf("Brightness: %d", userSettings.brightness); break;
-            case 1: M5Cardputer.Display.printf("Screen Off: %s", timeoutLabels[userSettings.timeoutIndex]); break;
-            case 2: M5Cardputer.Display.printf("Resume Play: %s", userSettings.resumePlay ? "ON" : "OFF"); break;
-            case 3: M5Cardputer.Display.printf("DAC Rate: %s", sampleRateLabels[userSettings.spkRateIndex]); break;
-            case 4: M5Cardputer.Display.printf("Wi-Fi Power: %s", userSettings.wifiEnabled ? "ON" : "OFF"); break;
-            case 5: M5Cardputer.Display.printf("Wi-Fi Mode: %s", userSettings.isAPMode ? "AP (Host)" : "STA (Client)"); break; 
-            case 6: M5Cardputer.Display.printf("Power Saver: %s", powerModeLabels[userSettings.powerSaverMode]); break;
-            case 7: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; 
-            case 8: M5Cardputer.Display.print("> Setup AP (Host)"); break;
-            case 9: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    
-            case 10: M5Cardputer.Display.print("[ EXPORT CONFIG TO SD ]"); break; // <-- NEW
-            case 11: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;      // <-- NEW
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN); M5Cardputer.Display.setCursor(xStart + 5, yStart + 16);
+        if (audioApp.currentTitle.length() > 0) M5Cardputer.Display.print(audioApp.currentTitle.substring(0, 15));
+        
+        if (audioApp.id3 && audioApp.file) {
+            int maxW = M5Cardputer.Display.width() - xStart - 10;
+            int curW = (int)((float)audioApp.id3->getPos() / (float)audioApp.id3->getSize() * maxW);
+            M5Cardputer.Display.fillRect(xStart-3, yStart+30-3, maxW+6, 9, C_BG_DARK ); M5Cardputer.Display.fillRect(xStart, yStart+30, maxW, 3, C_BG_LIGHT);
+            M5Cardputer.Display.fillRect(xStart, yStart+30, min(curW, maxW), 3, C_HIGHLIGHT); M5Cardputer.Display.fillCircle(xStart + min(curW, maxW), yStart+30+1, 3, C_TEXT_MAIN);
+        }
+
+        int volY = yStart + 42; M5Cardputer.Display.setCursor(xStart + 5, volY); M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(C_ACCENT); M5Cardputer.Display.print("VOL "); M5Cardputer.Display.drawRect(xStart + 30, volY, 60, 6, C_BG_LIGHT);
+        M5Cardputer.Display.fillRect(xStart + 31, volY + 1, (M5Cardputer.Speaker.getVolume() * 58) / 255, 4, C_ACCENT);
+    }
+
+    static void drawVisualizer() {
+        if (!audioApp.decoder || !audioApp.decoder->isRunning() || audioApp.isPaused || !showVisualizer) return;
+        auto buf = out->getBuffer();
+        if (buf) {
+            memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t)); fft.exec(raw_data); visSprite.fillScreen(C_BG_DARK); int visH = visSprite.height();
+            for (size_t bx = 0; bx < min((int)(visSprite.width() / 4), FFT_SIZE / 2); ++bx) {
+                int32_t barH = min((int)((fft.get(bx) * visH) >> 16), visH);
+                uint16_t color = barH < visH * 0.4 ? C_ACCENT : (barH < visH * 0.7 ? C_HIGHLIGHT : TFT_RED);
+                visSprite.fillRect(bx * 4, visH - barH, 3, barH, color);
+            }
+            visSprite.pushSprite(PLAYLIST_WIDTH + 2, HEADER_HEIGHT + 55);
         }
     }
 
-    // --- NEW: Draw Scroll Indicators ---
-    M5Cardputer.Display.setTextColor(C_ACCENT);
-    if (menuScrollOffset > 0) {
-        M5Cardputer.Display.drawString("^", px + pw - 15, startY);
-    }
-    if (menuScrollOffset + MAX_MENU_ROWS < TOTAL_SETTINGS) {
-        M5Cardputer.Display.drawString("v", px + pw - 15, startY + ((MAX_MENU_ROWS - 1) * gap));
-    }
+    static void drawSettings() {
+        drawPopup("SETTINGS", "Press 'Esc' to Exit");
+        int startY = 45, gap = 20;
+        int items = 13;
+        for (int i = 0; i < 4; i++) {
+            int idx = menuScrollOffset + i; if (idx >= items) break;
+            M5Cardputer.Display.setCursor(25, startY + (i * gap));
+            M5Cardputer.Display.setTextColor(idx == settingsCursor ? (idx == 4 ? TFT_RED : C_HIGHLIGHT) : C_TEXT_MAIN);
 
-    // Footer
-    M5Cardputer.Display.setCursor(px + 15, py + ph - 15);
-    M5Cardputer.Display.setTextColor(C_TEXT_DIM);
-    M5Cardputer.Display.print("Press 'Esc' to Exit");
-}
-
-void redrawUI() {
-    M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, M5Cardputer.Display.width(), M5Cardputer.Display.height() - HEADER_HEIGHT, C_BG_DARK);
-    drawHeader();
-    drawPlaylist();
-    drawNowPlayingInfo();
-    drawBottomBar();
-}
-
-// --- AUDIO LOGIC ---
-void stop_audio() {
-  if (decoder) { decoder->stop(); delete decoder; decoder = nullptr; }
-  if (id3) { id3->close(); delete id3; id3 = nullptr; }
-  if (buff) { buff->close(); delete buff; buff = nullptr; } // Clean up buffer
-  if (file) { file->close(); delete file; file = nullptr; }
-}
-
-void play_current(uint32_t startPos = 0) { // <-- NEW: Takes an optional starting position
-  stop_audio();
-  if (songOffsets.empty()) return;
-
-  currentTitle = ""; currentArtist = "";
-  browserIndex = currentFileIndex; 
-  
-  M5Cardputer.Display.fillScreen(C_BG_DARK);
-  drawHeader();
-  drawPlaylist();
-  drawBottomBar();
-
-  String fname = getSongPath(currentFileIndex);
-  
-  if (!SD.exists(fname)) {
-      M5Cardputer.Display.setTextColor(TFT_RED);
-      M5Cardputer.Display.setCursor(PLAYLIST_WIDTH + 10, HEADER_HEIGHT + 20);
-      M5Cardputer.Display.print("FILE ERROR:");
-      M5Cardputer.Display.setCursor(PLAYLIST_WIDTH + 10, HEADER_HEIGHT + 35);
-      M5Cardputer.Display.print(fname); 
-      return; 
-  }
-
-  file = new AudioFileSourceSD(fname.c_str());
-  // Create a 16KB pre-fetch buffer in RAM to prevent SD card stutter
-  buff = new AudioFileSourceBuffer(file, 16384); 
-  id3 = new AudioFileSourceID3(buff); // Note: ID3 now reads from buff, not file
-  id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
-  
-  // --- NEW: Seek the file BEFORE turning on the MP3 decoder ---
-  if (startPos > 0) {
-      id3->seek(startPos, 1);
-  }
-  
-// Route to the correct decoder based on extension
-  String fnameLower = fname;
-  fnameLower.toLowerCase();
-  
-  if (fnameLower.endsWith(".flac")) {
-      decoder = new AudioGeneratorFLAC();
-  } else if (fnameLower.endsWith(".m4a") || fnameLower.endsWith(".aac")) {
-      decoder = new AudioGeneratorAAC();
-  } else if (fnameLower.endsWith(".wav")) {
-      decoder = new AudioGeneratorWAV(); // NEW: Uncompressed WAV
-  } else {
-      decoder = new AudioGeneratorMP3();
-  }
-  decoder->begin(id3, out);
-  isPaused = false;
-  drawNowPlayingInfo();
-}
-
-void pause_audio() {
-  if (decoder && decoder->isRunning()) {
-    paused_at = id3->getPos();
-    decoder->stop();
-    isPaused = true;
-    drawNowPlayingInfo();
-  }
-}
-
-void resume_audio() {
-  if (!isPaused || songOffsets.empty()) return;
-  stop_audio();
-
-  // 1. Get the path using our new SD reader function
-  String fname = getSongPath(currentFileIndex);
-  
-  // 2. Safety check (prevents silent crashes!)
-  if (!SD.exists(fname)) {
-      M5Cardputer.Display.setTextColor(TFT_RED);
-      M5Cardputer.Display.setCursor(PLAYLIST_WIDTH + 10, HEADER_HEIGHT + 20);
-      M5Cardputer.Display.print("RESUME ERR:");
-      M5Cardputer.Display.setCursor(PLAYLIST_WIDTH + 10, HEADER_HEIGHT + 35);
-      M5Cardputer.Display.print(fname);
-      return; 
-  }
-
-  // 3. Restart the audio stream
-  file = new AudioFileSourceSD(fname.c_str());
-  // Create a 16KB pre-fetch buffer in RAM to prevent SD card stutter
-  buff = new AudioFileSourceBuffer(file, 16384); 
-  id3 = new AudioFileSourceID3(buff); // Note: ID3 now reads from buff, not file
-  id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
-  
-  // Jump back to where we paused
-  if (paused_at > 0) {
-      id3->seek(paused_at, 1);
-  }
-  
-// Route to the correct decoder based on extension
-  String fnameLower = fname;
-  fnameLower.toLowerCase();
-  
-  if (fnameLower.endsWith(".flac")) {
-      decoder = new AudioGeneratorFLAC();
-  } else if (fnameLower.endsWith(".m4a") || fnameLower.endsWith(".aac")) {
-      decoder = new AudioGeneratorAAC();
-  } else if (fnameLower.endsWith(".wav")) {
-      decoder = new AudioGeneratorWAV(); // NEW: Uncompressed WAV
-  } else {
-      decoder = new AudioGeneratorMP3();
-  }
-
-  decoder->begin(id3, out);
-  isPaused = false;
-  drawNowPlayingInfo();
-}
-
-void next_song(bool autoPlay = false) {
-    // 1. Safety check uses our new offset list
-    if (songOffsets.empty()) return;
-
-    if (autoPlay && loopMode == LOOP_ONE) { 
-        play_current(); 
-        return; 
-    }
-
-    if (isShuffle) {
-        // 2. Random selection uses new size
-        currentFileIndex = random(0, songOffsets.size());
-    } else {
-        currentFileIndex++;
-        // 3. Bounds checking uses new size
-        if (currentFileIndex >= songOffsets.size()) {
-            if (loopMode == LOOP_ALL) {
-                currentFileIndex = 0;
-            } else {
-                stop_audio(); 
-                currentFileIndex = 0;
-                M5Cardputer.Display.fillScreen(C_BG_DARK); 
-                drawPlaylist(); 
-                drawBottomBar();
-                return;
+            switch (idx) {
+                case 0: M5Cardputer.Display.printf("Brightness: %d", userSettings.brightness); break;
+                case 1: M5Cardputer.Display.printf("Screen Off: %s", timeoutLabels[userSettings.timeoutIndex]); break;
+                case 2: M5Cardputer.Display.printf("Resume Play: %s", userSettings.resumePlay ? "ON" : "OFF"); break;
+                case 3: M5Cardputer.Display.printf("DAC Rate: %s", sampleRateLabels[userSettings.spkRateIndex]); break;
+                case 4: M5Cardputer.Display.printf("Wi-Fi Power: %s", userSettings.wifiEnabled ? "ON" : "OFF"); break;
+                case 5: M5Cardputer.Display.printf("Wi-Fi Mode: %s", userSettings.isAPMode ? "AP (Host)" : "STA (Client)"); break; 
+                case 6: M5Cardputer.Display.printf("Power Saver: %s", powerModeLabels[userSettings.powerSaverMode]); break;
+                case 7: M5Cardputer.Display.printf("Theme: %s", themeLabels[userSettings.themeIndex]); break;
+                case 8: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; 
+                case 9: M5Cardputer.Display.print("> Setup AP (Host)"); break;
+                case 10: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    
+                case 11: M5Cardputer.Display.print("[ EXPORT CONFIG TO SD ]"); break; 
+                case 12: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;      
             }
         }
     }
-    play_current();
-}
 
-void prev_song() {
-    // 1. Safety check
-    if (songOffsets.empty()) return;
-
-    if (isShuffle) {
-        currentFileIndex = random(0, songOffsets.size());
-    } else {
-        currentFileIndex--;
-        // 2. Loop-around check uses new size
-        if (currentFileIndex < 0) {
-            currentFileIndex = songOffsets.size() - 1;
+    static void drawWifiScanner() {
+        M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN); M5Cardputer.Display.setCursor(5, 5); M5Cardputer.Display.print("Select Wi-Fi Network");
+        int yPos = HEADER_HEIGHT + 5;
+        if (wifiNetworkCount == 0) { M5Cardputer.Display.setCursor(10, yPos); M5Cardputer.Display.print("No networks found."); return; }
+        for (int i = 0; i < 6; i++) {
+            int idx = wifiScrollOffset + i; if (idx >= wifiNetworkCount) break;
+            if (idx == wifiCursor) { M5Cardputer.Display.fillRect(2, yPos - 2, M5Cardputer.Display.width() - 4, ROW_HEIGHT, C_ACCENT); M5Cardputer.Display.setTextColor(C_BG_DARK); } 
+            else M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+            M5Cardputer.Display.setCursor(10, yPos); M5Cardputer.Display.print(WiFi.SSID(idx).substring(0, 30)); yPos += ROW_HEIGHT;
         }
     }
-    play_current();
+
+    static void drawTextInput() {
+        M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN); M5Cardputer.Display.setCursor(5, 5); 
+        if (textInputTarget == 0) M5Cardputer.Display.print("Enter Client Password:");
+        else if (textInputTarget == 1) M5Cardputer.Display.print("Set AP Name (SSID):");
+        else if (textInputTarget == 2) M5Cardputer.Display.print("Set AP Password (8+ chars):");
+
+        M5Cardputer.Display.drawRect(10, HEADER_HEIGHT + 35, M5Cardputer.Display.width() - 20, 25, C_TEXT_MAIN);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN); M5Cardputer.Display.setCursor(15, HEADER_HEIGHT + 40);
+        
+        String displayStr = enteredText;
+        if (textInputTarget == 0) { displayStr = ""; for(int i=0; i<enteredText.length(); i++) displayStr += "*"; }
+        M5Cardputer.Display.print(displayStr + "_"); 
+        M5Cardputer.Display.setCursor(10, M5Cardputer.Display.height() - 20); M5Cardputer.Display.setTextColor(C_TEXT_DIM); M5Cardputer.Display.print("ENTER to Save  |  ` to Cancel");
+    }
+
+    static void drawBaseUI() {
+        M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, M5Cardputer.Display.width(), M5Cardputer.Display.height() - HEADER_HEIGHT, C_BG_DARK);
+        drawHeader(); drawPlaylist(); drawNowPlaying(); drawBottomBar();
+        if(!showVisualizer) { visSprite.fillScreen(C_BG_DARK); visSprite.pushSprite(PLAYLIST_WIDTH + 2, HEADER_HEIGHT + 55); }
+    }
+};
+
+int UIManager::settingsCursor = 0; int UIManager::menuScrollOffset = 0; bool UIManager::showVisualizer = true;
+int UIManager::wifiCursor = 0; int UIManager::wifiScrollOffset = 0; int UIManager::wifiNetworkCount = 0;
+int UIManager::helpScrollOffset = 0;
+
+void AudioEngine::MDCallback(void *cbData, const char *type, bool isUnicode, const char *string) {
+    if (string[0] == 0) return;
+    if (strcmp(type, "Title") == 0) { audioApp.currentTitle = String(string); if (currentState == UI_PLAYER) UIManager::drawNowPlaying(); } 
+    else if (strcmp(type, "Artist") == 0) { audioApp.currentArtist = String(string); }
 }
 
-void seek_audio(int seconds) {
-    if (!decoder || !decoder->isRunning() || !id3) return;
-    
-    uint32_t currentPos = id3->getPos();
-    uint32_t fileSize = id3->getSize();
-    int32_t jumpBytes = seconds * 16000;
-    int32_t newPos = currentPos + jumpBytes;
-    if (newPos < 0) newPos = 0;
-    if (newPos > fileSize) newPos = fileSize - 1000;
+// ==========================================
+// WEB SERVER MANAGER
+// ==========================================
+class WebServerManager {
+public:
+    static void setup() {
+        if (!userSettings.wifiEnabled) { WiFi.mode(WIFI_OFF); return; }
+        M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40); M5Cardputer.Display.setTextColor(C_ACCENT);
 
-    stop_audio();
-    String fname = getSongPath(currentFileIndex);
-    file = new AudioFileSourceSD(fname.c_str());
-    // Create a 16KB pre-fetch buffer in RAM to prevent SD card stutter
-    buff = new AudioFileSourceBuffer(file, 16384); 
-    id3 = new AudioFileSourceID3(buff); // Note: ID3 now reads from buff, not file
-    id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
-    id3->seek(newPos, 1);
-    
-    // Route to the correct decoder
-    String fnameLower = fname;
-    fnameLower.toLowerCase();
-    if (fnameLower.endsWith(".flac")) decoder = new AudioGeneratorFLAC();
-    else if (fnameLower.endsWith(".m4a") || fnameLower.endsWith(".aac")) decoder = new AudioGeneratorAAC();
-    else if (fnameLower.endsWith(".wav")) decoder = new AudioGeneratorWAV(); // NEW: Uncompressed WAV
-    else decoder = new AudioGeneratorMP3();
-    
-    decoder->begin(id3, out);
-}
-void initNVS() {
-    // Attempt to initialize NVS
-    esp_err_t err = nvs_flash_init();
-    
-    // Check if the NVS partition is corrupted or contains a new/unrecognized version
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        
-        M5Cardputer.Display.fillScreen(C_BG_DARK);
-        M5Cardputer.Display.setCursor(10, 40);
-        M5Cardputer.Display.setTextColor(TFT_ORANGE);
-        M5Cardputer.Display.print("NVS Corrupted! Reformatting...");
-        
-        // Wipe the NVS partition clean
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        
-        // Try initializing again
-        err = nvs_flash_init();
-        delay(1000); 
+        if (userSettings.isAPMode) {
+            M5Cardputer.Display.print("Starting AP Mode..."); WiFi.mode(WIFI_AP);
+            WiFi.softAP(userSettings.apSSID.c_str(), userSettings.apPass.c_str()); delay(1500);
+        } else if (userSettings.wifiSSID.length() > 0) {
+            M5Cardputer.Display.print("Connecting to Wi-Fi..."); WiFi.mode(WIFI_STA);
+            WiFi.begin(userSettings.wifiSSID.c_str(), userSettings.wifiPass.c_str()); int retry = 0;
+            while (WiFi.status() != WL_CONNECTED && retry < 15) { delay(500); M5Cardputer.Display.print("."); retry++; }
+            if (WiFi.status() != WL_CONNECTED) { M5Cardputer.Display.print("\nFailed! Offline Mode."); delay(2000); return; }
+        }
+
+        server.on("/", []() {
+            String html = R"rawliteral(
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Sam Music Player</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js"></script>
+<style>:root{--bg-dark:#15181C;--bg-light:#252830;--slate-blue:#4A5B82;--cyan:#00E5FF;--green:#00FF66;--magenta:#FF007F;}
+body{font-family:'Segoe UI',sans-serif;background-color:var(--bg-dark);color:#fff;padding:20px;max-width:650px;margin:0 auto;}
+h1{color:var(--cyan);text-align:center;font-weight:300;letter-spacing:2px;}
+.player-card{background:var(--bg-light);padding:20px;border-radius:12px;box-shadow:0 8px 20px rgba(0,0,0,0.6);position:sticky;top:10px;z-index:100;border:1px solid #333;}
+.now-playing-container{display:flex;align-items:center;gap:20px;margin-bottom:20px;}
+.cover-wrapper{width:100px;height:100px;flex-shrink:0;background:var(--bg-dark);border-radius:8px;display:flex;justify-content:center;align-items:center;overflow:hidden;border:1px solid var(--slate-blue);}
+#cover-art{width:100%;height:100%;object-fit:cover;display:none;} #cover-placeholder{color:var(--slate-blue);font-size:30px;}
+.track-details{flex-grow:1;overflow:hidden;}
+#track-title{font-size:1.3em;color:var(--green);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:bold;}
+#track-artist{font-size:1em;color:var(--cyan);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#track-album{font-size:0.85em;color:#aaa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+audio{width:100%;margin-bottom:15px;outline:none;border-radius:5px;height:40px;}
+.controls{display:flex;justify-content:center;gap:12px;margin-bottom:5px;}
+button{background:var(--slate-blue);color:#fff;border:none;padding:10px 18px;border-radius:6px;cursor:pointer;font-size:16px;transition:0.2s;}
+button:hover{background:var(--cyan);color:var(--bg-dark);transform:scale(1.05);} button.active{background:var(--magenta);color:#fff;}
+.search-box{margin-top:25px;text-align:center;}
+#searchBar{width:100%;padding:12px 20px;border-radius:25px;border:1px solid var(--slate-blue);background:var(--bg-dark);color:#fff;font-size:16px;outline:none;box-sizing:border-box;}
+ul{list-style:none;padding:0;margin-top:20px;}
+li{display:flex;justify-content:space-between;align-items:center;background:var(--bg-light);margin-bottom:8px;border-radius:6px;border-left:4px solid transparent;}
+li:hover{background:var(--slate-blue);} li.playing{background:#1A2933;border-left:4px solid var(--cyan);}
+.song-info{flex-grow:1;padding:14px;cursor:pointer;display:flex;align-items:center;}
+.track-num{color:#888;margin-right:15px;font-size:0.85em;width:25px;text-align:right;}
+li.playing .track-num, li.playing .track-name{color:var(--cyan);font-weight:bold;}
+.dl-btn{background:#333;color:#fff;text-decoration:none;padding:8px 12px;border-radius:4px;margin-right:10px;font-size:1.1em;}
+.dl-btn:hover{background:var(--magenta);}
+</style></head><body>
+<h1>SAM MUSIC PLAYER</h1>
+<div class="player-card"><div class="now-playing-container"><div class="cover-wrapper"><div id="cover-placeholder">🎵</div><img id="cover-art" src=""></div>
+<div class="track-details"><div id="track-title">Select a song</div><div id="track-artist"></div><div id="track-album"></div></div></div>
+<audio id="player" controls></audio>
+<div class="controls"><button id="btnPrev">⏮</button><button id="btnNext">⏭</button><button id="btnShuffle">🔀</button><button id="btnLoop">🔁</button></div></div>
+<div class="search-box"><input type="text" id="searchBar" placeholder="Search..."></div>
+<ul id="playlist"><li>Loading library...</li></ul>
+<script>
+let songs=[],currentIndex=-1,isShuffle=!1,loopMode=0;
+const player=document.getElementById('player'),btnPrev=document.getElementById('btnPrev'),btnNext=document.getElementById('btnNext');
+const btnShuffle=document.getElementById('btnShuffle'),btnLoop=document.getElementById('btnLoop'),playlistEl=document.getElementById('playlist'),searchBar=document.getElementById('searchBar');
+const titleEl=document.getElementById('track-title'),artistEl=document.getElementById('track-artist'),albumEl=document.getElementById('track-album'),coverArt=document.getElementById('cover-art'),coverPlaceholder=document.getElementById('cover-placeholder');
+fetch('/api/songs').then(r=>r.json()).then(data=>{songs=data;playlistEl.innerHTML='';
+songs.forEach((song,idx)=>{let li=document.createElement('li');li.id='song-'+idx;li.className='song-item';
+let infoDiv=document.createElement('div');infoDiv.className='song-info';infoDiv.innerHTML=`<span class="track-num">${idx+1}</span> <span class="track-name">${song}</span>`;
+infoDiv.onclick=()=>playSong(idx);let dlLink=document.createElement('a');dlLink.className='dl-btn';dlLink.href='/download?id='+idx;dlLink.innerText='💾';
+li.appendChild(infoDiv);li.appendChild(dlLink);playlistEl.appendChild(li);});}).catch(e=>playlistEl.innerHTML='Error');
+searchBar.addEventListener('input',e=>{const term=e.target.value.toLowerCase();Array.from(playlistEl.getElementsByClassName('song-item')).forEach(i=>{i.style.display=i.querySelector('.track-name').innerText.toLowerCase().includes(term)?'flex':'none';});});
+function playSong(index){if(index<0||index>=songs.length)return;if(currentIndex!==-1){let o=document.getElementById('song-'+currentIndex);if(o)o.classList.remove('playing');}
+currentIndex=index;let n=document.getElementById('song-'+currentIndex);if(n){n.classList.add('playing');n.scrollIntoView({behavior:'smooth',block:'center'});}
+const fileUrl='/stream?id='+currentIndex; player.src=''; titleEl.innerText='Loading...';artistEl.innerText='';albumEl.innerText='';coverArt.style.display='none';coverPlaceholder.style.display='block';
+fetch(fileUrl+'&meta=1').then(r=>r.blob()).then(blob=>{window.jsmediatags.read(blob,{onSuccess:t=>{const tags=t.tags;titleEl.innerText=tags.title||songs[currentIndex];artistEl.innerText=tags.artist||'Unknown Artist';albumEl.innerText=tags.album||'';
+if(tags.picture){try{const b=new Blob([new Uint8Array(tags.picture.data)],{type:tags.picture.format});coverArt.src=URL.createObjectURL(b);coverArt.style.display='block';coverPlaceholder.style.display='none';}catch(e){}}
+player.src=fileUrl;player.play();},onError:e=>{titleEl.innerText=songs[currentIndex];player.src=fileUrl;player.play();}});}).catch(e=>{player.src=fileUrl;player.play();});}
+function playNext(){if(!songs.length)return;if(loopMode===1){playSong(currentIndex);return;}if(isShuffle){let r;do{r=Math.floor(Math.random()*songs.length);}while(r===currentIndex&&songs.length>1);playSong(r);}else playSong((currentIndex+1)%songs.length);}
+function playPrev(){if(!songs.length)return;if(currentIndex===-1)currentIndex=0;playSong((currentIndex-1+songs.length)%songs.length);}
+btnNext.onclick=playNext;btnPrev.onclick=playPrev;btnShuffle.onclick=()=>{isShuffle=!isShuffle;btnShuffle.classList.toggle('active',isShuffle);};btnLoop.onclick=()=>{loopMode=(loopMode+1)%2;btnLoop.innerText=loopMode===1?'🔂':'🔁';btnLoop.classList.toggle('active',loopMode===1);};
+player.addEventListener('ended',playNext);
+</script></body></html>
+)rawliteral";
+            server.send(200, "text/html", html);
+        });
+
+        server.on("/api/songs", []() {
+            if (!SD.exists(PLAYLIST_FILE)) { server.send(500, "text/plain", "No Playlist"); return; }
+            server.setContentLength(CONTENT_LENGTH_UNKNOWN); server.send(200, "application/json", ""); server.sendContent("[\n");
+            File f = SD.open(PLAYLIST_FILE); String jsonBuffer = ""; bool first = true;
+            while (f.available()) {
+                String line = f.readStringUntil('\n'); line.trim(); int slashIdx = line.lastIndexOf('/'); if (slashIdx >= 0) line = line.substring(slashIdx + 1);
+                line.replace("\"", "\\\"");
+                if (line.length() > 0) {
+                    if (!first) jsonBuffer += ",\n"; jsonBuffer += "\"" + line + "\""; first = false;
+                    if (jsonBuffer.length() > 1024) { server.sendContent(jsonBuffer); jsonBuffer = ""; }
+                }
+            }
+            f.close(); if (jsonBuffer.length() > 0) server.sendContent(jsonBuffer);
+            server.sendContent("\n]"); server.sendContent("");
+        });
+
+        server.on("/stream", []() {
+            if (!server.hasArg("id")) { server.send(400, "text/plain", "Missing ID"); return; }
+            String path = audioApp.getSongPath(server.arg("id").toInt()); File f = SD.open(path);
+            if (!f) { server.send(404, "text/plain", "Not found"); return; }
+            if (server.hasArg("meta")) {
+                size_t chunkSize = min((size_t)655360, f.size()); server.setContentLength(chunkSize); server.send(200, "audio/mpeg", "");
+                uint8_t buffer[2048]; size_t remaining = chunkSize;
+                while (f.available() && remaining > 0) {
+                    size_t bytesRead = f.read(buffer, min(remaining, sizeof(buffer)));
+                    if (bytesRead == 0) break; server.client().write(buffer, bytesRead); remaining -= bytesRead;
+                }
+            } else server.streamFile(f, "audio/mpeg");
+            f.close();
+        });
+
+        server.on("/download", []() {
+            if (!server.hasArg("id")) { server.send(400, "text/plain", "Missing ID"); return; }
+            String path = audioApp.getSongPath(server.arg("id").toInt()); File f = SD.open(path);
+            if (!f) { server.send(404, "text/plain", "Not found"); return; }
+            int slashIdx = path.lastIndexOf('/'); String filename = (slashIdx >= 0) ? path.substring(slashIdx + 1) : path;
+            server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\""); server.streamFile(f, "audio/mpeg");
+            f.close();
+        });
+
+        server.begin();
     }
-    
-    // If it STILL fails, print an error (but don't crash)
-    if (err != ESP_OK) {
-        M5Cardputer.Display.fillScreen(C_BG_DARK);
-        M5Cardputer.Display.setCursor(10, 40);
-        M5Cardputer.Display.setTextColor(TFT_RED);
-        M5Cardputer.Display.printf("NVS Init Failed: %s", esp_err_to_name(err));
-        delay(2000);
-    }
-}
-// --- SETUP ---
+};
+
+// ==========================================
+// MAIN SETUP & LOOP
+// ==========================================
 void setup() {
-  auto cfg = M5.config();
-  cfg.external_speaker.hat_spk = true;
-  M5Cardputer.begin(cfg);
-//   M5Cardputer.Power.setBatteryCharge(true);
-    initNVS();
-  auto spk_cfg = M5Cardputer.Speaker.config();
-  spk_cfg.sample_rate = 128000;
-  spk_cfg.task_pinned_core = APP_CPU_NUM;
-  spk_cfg.dma_buf_count = 8;              // NEW: Increased DMA buffers
-  spk_cfg.dma_buf_len = 256;              // NEW: Increased DMA chunk size
-  spk_cfg.task_priority = 3;              // NEW: Higher priority for audio task    
-  M5Cardputer.Speaker.config(spk_cfg);
-  out = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
+    auto cfg = M5.config(); cfg.external_speaker.hat_spk = true; M5Cardputer.begin(cfg);
+    
+    if (nvs_flash_init() != ESP_OK) { nvs_flash_erase(); nvs_flash_init(); }
+    ConfigManager::load(); applyCpuFrequency();
+    applyTheme(userSettings.themeIndex);
+    auto spk_cfg = M5Cardputer.Speaker.config(); spk_cfg.sample_rate = sampleRateValues[userSettings.spkRateIndex];
+    spk_cfg.task_pinned_core = APP_CPU_NUM; spk_cfg.dma_buf_count = 8; spk_cfg.dma_buf_len = 256; spk_cfg.task_priority = 3;    
+    M5Cardputer.Speaker.config(spk_cfg);
+    out = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
 
-  M5Cardputer.Display.setRotation(1);
-  M5Cardputer.Display.setFont(&fonts::lgfxJapanGothic_12);
+    M5Cardputer.Display.setRotation(1); visSprite.setColorDepth(16); 
+    visSprite.createSprite(M5Cardputer.Display.width() - PLAYLIST_WIDTH - 2, M5Cardputer.Display.height() - HEADER_HEIGHT - 55 - BOTTOM_BAR_HEIGHT);
 
-  int visX = PLAYLIST_WIDTH + 2;
-  int visY = HEADER_HEIGHT + 55;
-  int visW = M5Cardputer.Display.width() - visX;
-  int visH = M5Cardputer.Display.height() - visY - BOTTOM_BAR_HEIGHT;
-  visSprite.setColorDepth(16); 
-  visSprite.createSprite(visW, visH);
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
+    if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) while(1);
 
-  SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
-  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
-    M5Cardputer.Display.print("SD Card Failed");
-    while(1);
-  }
-
-  // ... SD Card initialization ...
-
-  // // --- NEW: Start Wi-Fi & Web Server ---
-  // M5Cardputer.Display.fillScreen(C_BG_DARK);
-  // M5Cardputer.Display.setCursor(10, 40);
-  // M5Cardputer.Display.setTextColor(C_ACCENT);
-  // M5Cardputer.Display.print("Connecting to Wi-Fi...");
-  
-  // WiFi.begin(ssid, password);
-  // int retry = 0;
-  // while (WiFi.status() != WL_CONNECTED && retry < 20) {
-  //     delay(500);
-  //     M5Cardputer.Display.print(".");
-  //     retry++;
-  // }
-
-  // if (WiFi.status() == WL_CONNECTED) {
-  //     server.on("/", handleRoot);
-  //     server.on("/api/songs", handleSongList);
-  //     server.on("/stream", handleStream);
-  //     server.begin();
-      
-  //     // Briefly show the IP address so you know what to type in your browser!
-  //     M5Cardputer.Display.fillScreen(C_BG_DARK);
-  //     M5Cardputer.Display.setCursor(10, 40);
-  //     M5Cardputer.Display.print("Web UI: ");
-  //     M5Cardputer.Display.println(WiFi.localIP());
-  //     delay(3000); 
-  // }
-  // -------------------------------------
-
-  // ... (Load Config and Playlist logic follows this)
-
-
-  loadConfig();
-
-if (userSettings.wifiEnabled) {
-      M5Cardputer.Display.fillScreen(C_BG_DARK);
-      M5Cardputer.Display.setCursor(10, 40);
-      M5Cardputer.Display.setTextColor(C_ACCENT);
-
-      if (userSettings.isAPMode) {
-          // --- AP MODE START ---
-          M5Cardputer.Display.print("Starting AP Mode...");
-          WiFi.mode(WIFI_AP);
-          
-          // The network name and password (password must be at least 8 characters)
-          WiFi.softAP(userSettings.apSSID.c_str(), userSettings.apPass.c_str()); 
-          delay(1500);
-
-          server.on("/", handleRoot);
-          server.on("/api/songs", handleSongList);
-          server.on("/stream", handleStream);
-          server.on("/download", handleDownload);
-          server.begin();
-      } else if (userSettings.wifiSSID.length() > 0) {
-          // --- STANDARD CLIENT MODE START ---
-          M5Cardputer.Display.print("Connecting to Wi-Fi...");
-          WiFi.mode(WIFI_STA);
-          WiFi.begin(userSettings.wifiSSID.c_str(), userSettings.wifiPass.c_str());
-          int retry = 0;
-          while (WiFi.status() != WL_CONNECTED && retry < 15) {
-              delay(500); M5Cardputer.Display.print("."); retry++;
-          }
-
-          if (WiFi.status() == WL_CONNECTED) {
-              server.on("/", handleRoot);
-              server.on("/api/songs", handleSongList);
-              server.on("/stream", handleStream);
-              server.on("/download", handleDownload);
-              server.begin();
-          } else {
-              M5Cardputer.Display.print("\nFailed! Starting Offline Mode.");
-              delay(2000);
-          }
-      }
-  } else {
-      WiFi.mode(WIFI_OFF); // Save battery!
-  }
-  M5Cardputer.Display.setBrightness(userSettings.brightness);
-  auto spk_cfg_updated = M5Cardputer.Speaker.config();
-  spk_cfg_updated.sample_rate = sampleRateValues[userSettings.spkRateIndex];
-  M5Cardputer.Speaker.config(spk_cfg_updated);
-  M5Cardputer.Display.fillScreen(C_BG_DARK);
-  M5Cardputer.Display.setCursor(10, 40);
-  M5Cardputer.Display.setTextColor(C_ACCENT);
-  M5Cardputer.Display.println("Checking Library...");
-  
-  if (!loadPlaylist()) performFullScan();
-  else { M5Cardputer.Display.println("Loaded!"); delay(200); }
-
-// --- NEW: Cleaned up startup logic ---
-  if (songOffsets.size() > 0) {
-      if (userSettings.resumePlay && userSettings.lastIndex < songOffsets.size()) {
-          currentFileIndex = userSettings.lastIndex;
-          // Pass the saved position directly into the play function
-          play_current(userSettings.lastPos); 
-          
-      } else {
-          currentFileIndex = 0;
-          browserIndex = 0;
-          play_current();
-      }
-  } else {
-    M5Cardputer.Display.fillScreen(C_BG_DARK);
-    M5Cardputer.Display.setCursor(10, 40);
-    M5Cardputer.Display.setTextColor(TFT_RED);
-    M5Cardputer.Display.print("No MP3 Files Found!");
-  }
-  
-  lastInputTime = millis();
+    WebServerManager::setup();
+    M5Cardputer.Display.setBrightness(userSettings.brightness);
+    
+    if (audioApp.loadPlaylist()) {
+        if (userSettings.resumePlay && userSettings.lastIndex < audioApp.songOffsets.size()) audioApp.play(userSettings.lastIndex, userSettings.lastPos); 
+        else audioApp.play(0);
+    } else {
+        audioApp.performFullScan(); 
+        if(audioApp.songOffsets.size() > 0) audioApp.play(0);
+    }
+    
+    UIManager::drawBaseUI(); lastInputTime = millis();
 }
 
-// --- LOOP ---
 void loop() {
-  M5Cardputer.update();
-
-  server.handleClient();
-
-  // --- NEW: BTN A (G0) HANDLING ---
-  if( M5Cardputer.BtnA.wasDecideClickCount()){
-  // getClickCount() returns the number of clicks after a brief timeout
-    int clicks = M5Cardputer.BtnA.getClickCount();
-    
-    if (clicks > 0) {
-        if (clicks == 1) {
-            // 1 Click: Play / Pause
-            if (songOffsets.size() > 0) { // <--- MUST BE songOffsets
-                if (isPaused) resume_audio(); 
-                else pause_audio();
-                saveConfig(); 
-            }
-        } 
-        else if (clicks == 2) {
-            // 2 Clicks: Next Song
-            next_song(false);
-        } 
-        else if (clicks == 3) {
-            // 3 Clicks: Previous Song
-            prev_song();
-        }
+    M5Cardputer.update(); server.handleClient(); audioApp.loopTasks();
+    static int lastPlayingIndex = -1;
+    if (lastPlayingIndex != audioApp.currentIndex && currentState == UI_PLAYER && !isScreenOff) {
+        lastPlayingIndex = audioApp.currentIndex;
+        UIManager::drawHeader();       // Updates the [1/50] song counter
+        UIManager::drawPlaylist();     // Moves the > cursor
+        UIManager::drawNowPlaying();   // Updates the track name & cover area
+        UIManager::drawBottomBar();    // Updates the MP3/FLAC badge!
     }
-  }
+    if (currentState == UI_PLAYER && !isScreenOff) {
+        static unsigned long lastVis = 0; if (millis() - lastVis > 30) { UIManager::drawVisualizer(); lastVis = millis(); }
+        static unsigned long lastBat = 0; if (millis() - lastBat > 10000) { UIManager::drawBattery(); lastBat = millis(); }
+        static unsigned long lastProg = 0; if (millis() - lastProg > 1000) { UIManager::drawNowPlaying(); lastProg = millis(); }
+    }
 
-  // Screen Timeout
-  if (userSettings.timeoutIndex > 0 && !isScreenOff) {
-      if (millis() - lastInputTime > timeoutValues[userSettings.timeoutIndex]) {
-          M5Cardputer.Display.setBrightness(0);
-          M5Cardputer.Display.sleep(); // <-- Turns off the LCD controller
-          isScreenOff = true;
-      }
-  }
+    if (userSettings.timeoutIndex > 0 && !isScreenOff) {
+        if (millis() - lastInputTime > timeoutValues[userSettings.timeoutIndex]) { M5Cardputer.Display.setBrightness(0); M5Cardputer.Display.sleep(); isScreenOff = true; }
+    }
 
-  // Audio Loop
-  if (decoder && decoder->isRunning()) {
-    if (!decoder->loop()) {
-      decoder->stop();
-      next_song(true); 
-      if(userSettings.resumePlay) saveConfig();
+    if(M5Cardputer.BtnA.wasDecideClickCount()){
+        int clicks = M5Cardputer.BtnA.getClickCount();
+        if (clicks == 1) { audioApp.togglePause(); ConfigManager::save(audioApp.id3 ? audioApp.id3->getPos() : 0, audioApp.currentIndex); }
+        else if (clicks == 2) audioApp.next();
+        else if (clicks == 3) audioApp.prev();
+        if (currentState == UI_PLAYER && !isScreenOff) UIManager::drawNowPlaying();
     }
-    static unsigned long lastVisTime = 0;
-    if (!showHelpPopup && !showSettingsMenu && showVisualizer && !isScreenOff && !showTextInput) {
-        if (millis() - lastVisTime > visRefreshTime) { 
-            drawVisualizer();
-            lastVisTime = millis();
-        }
-    }
-    static unsigned long lastProgTime = 0;
-    if (!showHelpPopup && !showSettingsMenu && !isScreenOff && showTextInput) {
-        if (millis() - lastProgTime > 500) { 
-            drawProgressBar();
-            lastProgTime = millis();
-        }
-    }
-    
-    if (millis() - lastBatteryUpdate > BATTERY_UPDATE_INTERVAL) {
-        if (!showHelpPopup && !showSettingsMenu && !isScreenOff) drawBattery();
-        lastBatteryUpdate = millis();
-    }
-  }
 
-  // Input Handling
-  if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-      if (isScreenOff) {
-          M5Cardputer.Display.wakeup();
-          M5Cardputer.Display.setBrightness(userSettings.brightness);
-          isScreenOff = false;
-          lastInputTime = millis();
-          redrawUI();
-          return;
-      }
-      // --- TEXT TYPING LOGIC ---
-        if (showTextInput) {
-            auto status = M5Cardputer.Keyboard.keysState();
-            bool redraw = false;
-            if (status.del && enteredText.length() > 0) {
-                enteredText.remove(enteredText.length() - 1);
-                redraw = true;
-            } else if (status.enter) {
-                if (textInputTarget == 0) {
-                    // Saved Client Wi-Fi Password
-                    userSettings.wifiPass = enteredText;
-                    userSettings.wifiEnabled = true;
-                    saveConfig();
-                    showTextInput = false;
-                    ESP.restart(); 
-                } else if (textInputTarget == 1) {
-                    // Saved AP SSID, move to AP Password
-                    userSettings.apSSID = enteredText;
-                    textInputTarget = 2; 
-                    enteredText = userSettings.apPass; // Pre-fill current password
-                    redraw = true;
-                } else if (textInputTarget == 2) {
-                    // Saved AP Password (Requires 8 chars minimum for ESP32 AP to work)
-                    if (enteredText.length() < 8) {
-                        M5Cardputer.Display.setCursor(15, HEADER_HEIGHT + 65);
-                        M5Cardputer.Display.setTextColor(TFT_RED);
-                        M5Cardputer.Display.print("Must be 8+ chars!");
-                        delay(1000);
-                        redraw = true;
+    if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+        if (isScreenOff) { M5Cardputer.Display.wakeup(); M5Cardputer.Display.setBrightness(userSettings.brightness); isScreenOff = false; lastInputTime = millis(); UIManager::drawBaseUI(); return; }
+        lastInputTime = millis();
+
+        switch (currentState) {
+            case UI_PLAYER:
+                if (M5Cardputer.Keyboard.isKeyPressed('`')) { currentState = UI_SETTINGS; UIManager::drawSettings(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('i')) { currentState = UI_HELP; UIManager::drawHelp(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed(';')) { audioApp.browserIndex = (audioApp.browserIndex - 1 + audioApp.songOffsets.size()) % audioApp.songOffsets.size(); UIManager::drawPlaylist(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('.')) { audioApp.browserIndex = (audioApp.browserIndex + 1) % audioApp.songOffsets.size(); UIManager::drawPlaylist(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
+                    if (audioApp.browserIndex != audioApp.currentIndex) {
+                        audioApp.play(audioApp.browserIndex); 
                     } else {
-                        userSettings.apPass = enteredText;
-                        userSettings.isAPMode = true;
-                        userSettings.wifiEnabled = true;
-                        saveConfig();
-                        showTextInput = false;
-                        ESP.restart(); 
+                        audioApp.togglePause();
+                        UIManager::drawNowPlaying(); // Only redraws to show [ PAUSED ]
+                    }
+                    ConfigManager::save(audioApp.id3 ? audioApp.id3->getPos() : 0, audioApp.currentIndex);
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('n')) { audioApp.next(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('b')) { audioApp.prev(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('s')) { audioApp.isShuffle = !audioApp.isShuffle; UIManager::drawNowPlaying(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('l')) { audioApp.loopMode = (LoopState)((audioApp.loopMode + 1) % 3); UIManager::drawNowPlaying(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('v')) { UIManager::showVisualizer = !UIManager::showVisualizer; UIManager::drawBaseUI(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('/')) { audioApp.seek(5); UIManager::drawNowPlaying(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed(',')) { audioApp.seek(-5); UIManager::drawNowPlaying(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed(']')) { M5Cardputer.Speaker.setVolume(min(255, M5Cardputer.Speaker.getVolume() + 10)); UIManager::drawNowPlaying(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('[')) { M5Cardputer.Speaker.setVolume(max(0, M5Cardputer.Speaker.getVolume() - 10)); UIManager::drawNowPlaying(); }
+                break;
+
+            case UI_SETTINGS:
+                if (M5Cardputer.Keyboard.isKeyPressed('`')) { ConfigManager::save(); currentState = UI_PLAYER; UIManager::drawBaseUI(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
+                    UIManager::settingsCursor = (UIManager::settingsCursor - 1 + 12) % 12;
+                    if (UIManager::settingsCursor < UIManager::menuScrollOffset) UIManager::menuScrollOffset = UIManager::settingsCursor;
+                    else if (UIManager::settingsCursor == 11) UIManager::menuScrollOffset = 8;
+                    UIManager::drawSettings(); 
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
+                    UIManager::settingsCursor = (UIManager::settingsCursor + 1) % 12; 
+                    if (UIManager::settingsCursor >= UIManager::menuScrollOffset + 4) UIManager::menuScrollOffset++;
+                    else if (UIManager::settingsCursor == 0) UIManager::menuScrollOffset = 0;
+                    UIManager::drawSettings(); 
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('/') || M5Cardputer.Keyboard.isKeyPressed(',')) {
+                    bool right = M5Cardputer.Keyboard.isKeyPressed('/');
+                    switch (UIManager::settingsCursor) {
+                        case 0: userSettings.brightness = constrain(userSettings.brightness + (right?25:-25), 5, 255); M5Cardputer.Display.setBrightness(userSettings.brightness); break;
+                        case 1: userSettings.timeoutIndex = (userSettings.timeoutIndex + (right?1:-1) + 5) % 5; break;
+                        case 2: userSettings.resumePlay = !userSettings.resumePlay; break;
+                        case 3: userSettings.spkRateIndex = (userSettings.spkRateIndex + (right?1:-1) + 5) % 5; 
+                                { auto c = M5Cardputer.Speaker.config(); c.sample_rate = sampleRateValues[userSettings.spkRateIndex]; M5Cardputer.Speaker.config(c); } break;
+                        case 4: userSettings.wifiEnabled = !userSettings.wifiEnabled; break;
+                        case 5: userSettings.isAPMode = !userSettings.isAPMode; break;
+                        case 6: userSettings.powerSaverMode = (userSettings.powerSaverMode + (right?1:-1) + 3) % 3; applyCpuFrequency(); break;
+                        case 7: // --- THEME SWITCHER ---
+                            userSettings.themeIndex = (userSettings.themeIndex + (right?1:-1) + NUM_THEMES) % NUM_THEMES;
+                            applyTheme(userSettings.themeIndex);
+                            UIManager::drawBaseUI(); // Redraw background instantly to show off new colors
+                            break;
+                    }
+                    UIManager::drawSettings();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
+                    switch(UIManager::settingsCursor) {
+                        case 8: // Wi-Fi Setup
+                            currentState = UI_WIFI_SCAN; WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(100);
+                            UIManager::wifiNetworkCount = WiFi.scanNetworks(); UIManager::wifiCursor = 0; UIManager::wifiScrollOffset = 0;
+                            UIManager::drawWifiScanner(); break;
+                        case 9: // AP Setup
+                            currentState = UI_TEXT_INPUT; textInputTarget = 1; enteredText = userSettings.apSSID;
+                            UIManager::drawTextInput(); break;
+                        case 10: audioApp.performFullScan(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 11: ConfigManager::exportToSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 12: ConfigManager::importFromSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
                     }
                 }
-            } else if (M5Cardputer.Keyboard.isKeyPressed('`')) {
-                showTextInput = false;
-                showSettingsMenu = true;
-                drawSettingsMenu();
-            } else {
-                for (char c : status.word) {
-                    enteredText += c;
-                    redraw = true;
+                break;
+
+            case UI_HELP:
+                if (M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('`')) { 
+                    currentState = UI_PLAYER; UIManager::drawBaseUI(); 
                 }
-            }
-            if (redraw) drawTextInput();
-            return;
+                else if (M5Cardputer.Keyboard.isKeyPressed(';')) {
+                    UIManager::helpScrollOffset--;
+                    if (UIManager::helpScrollOffset < 0) UIManager::helpScrollOffset = 0;
+                    UIManager::drawHelp();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('.')) {
+                    UIManager::helpScrollOffset++;
+                    if (UIManager::helpScrollOffset > numHelpLines - 7) UIManager::helpScrollOffset = numHelpLines - 7;
+                    UIManager::drawHelp();
+                }
+                break;
+
+            case UI_WIFI_SCAN:
+                if (M5Cardputer.Keyboard.isKeyPressed('`')) { currentState = UI_SETTINGS; UIManager::drawSettings(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed(';')) {
+                    UIManager::wifiCursor--; if (UIManager::wifiCursor < 0) UIManager::wifiCursor = UIManager::wifiNetworkCount - 1;
+                    if (UIManager::wifiCursor < UIManager::wifiScrollOffset) UIManager::wifiScrollOffset = UIManager::wifiCursor;
+                    if (UIManager::wifiCursor == UIManager::wifiNetworkCount - 1) UIManager::wifiScrollOffset = max(0, UIManager::wifiNetworkCount - 6);
+                    UIManager::drawWifiScanner();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('.')) {
+                    UIManager::wifiCursor++; if (UIManager::wifiCursor >= UIManager::wifiNetworkCount) { UIManager::wifiCursor = 0; UIManager::wifiScrollOffset = 0; }
+                    if (UIManager::wifiCursor >= UIManager::wifiScrollOffset + 6) UIManager::wifiScrollOffset++;
+                    UIManager::drawWifiScanner();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
+                    userSettings.wifiSSID = WiFi.SSID(UIManager::wifiCursor);
+                    enteredText = ""; currentState = UI_TEXT_INPUT; textInputTarget = 0;
+                    UIManager::drawTextInput();
+                }
+                break;
+
+            case UI_TEXT_INPUT:
+                auto status = M5Cardputer.Keyboard.keysState(); bool redraw = false;
+                if (status.del && enteredText.length() > 0) { enteredText.remove(enteredText.length() - 1); redraw = true; } 
+                else if (status.enter) {
+                    if (textInputTarget == 0) { userSettings.wifiPass = enteredText; userSettings.wifiEnabled = true; ConfigManager::save(); ESP.restart(); } 
+                    else if (textInputTarget == 1) { userSettings.apSSID = enteredText; textInputTarget = 2; enteredText = userSettings.apPass; redraw = true; } 
+                    else if (textInputTarget == 2) {
+                        if (enteredText.length() < 8) { M5Cardputer.Display.setCursor(15, HEADER_HEIGHT + 65); M5Cardputer.Display.setTextColor(TFT_RED); M5Cardputer.Display.print("Must be 8+ chars!"); delay(1000); redraw = true; } 
+                        else { userSettings.apPass = enteredText; userSettings.isAPMode = true; userSettings.wifiEnabled = true; ConfigManager::save(); ESP.restart(); }
+                    }
+                } 
+                else if (M5Cardputer.Keyboard.isKeyPressed('`')) { currentState = UI_SETTINGS; UIManager::drawSettings(); } 
+                else { for (char c : status.word) { enteredText += c; redraw = true; } }
+                if (redraw) UIManager::drawTextInput();
+                break;
         }
-
-      // --- WIFI SCANNER SCROLLING LOGIC ---
-      if (showWifiScanner) {
-          if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
-              wifiCursor--; 
-              if (wifiCursor < 0) wifiCursor = wifiNetworkCount - 1;
-              if (wifiCursor < wifiScrollOffset) wifiScrollOffset = wifiCursor;
-              if (wifiCursor == wifiNetworkCount - 1) wifiScrollOffset = max(0, wifiNetworkCount - 6);
-              drawWifiScanner();
-          }
-          if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
-              wifiCursor++; 
-              if (wifiCursor >= wifiNetworkCount) { wifiCursor = 0; wifiScrollOffset = 0; }
-              if (wifiCursor >= wifiScrollOffset + 6) wifiScrollOffset++;
-              drawWifiScanner();
-          }
-          if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
-              userSettings.wifiSSID = WiFi.SSID(wifiCursor);
-              enteredText = "";
-              showWifiScanner = false;
-              showTextInput = true;
-              textInputTarget = 0; // Target: Client Password
-              drawTextInput();
-          }
-          if (M5Cardputer.Keyboard.isKeyPressed('`')) {
-              showWifiScanner = false;
-              showSettingsMenu = true;
-              drawSettingsMenu();
-          }
-          return;
-      }
-      lastInputTime = millis();
-
-      // --- MENU NAVIGATION ---
-      if (showSettingsMenu) {
-          bool needRedraw = false;
-          
-          // UP KEY (;)
-          if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
-              settingsCursor--; 
-              if (settingsCursor < 0) {
-                  // Wrap to bottom
-                  settingsCursor = TOTAL_SETTINGS - 1;
-                  menuScrollOffset = TOTAL_SETTINGS - MAX_MENU_ROWS;
-                  if (menuScrollOffset < 0) menuScrollOffset = 0;
-              } else if (settingsCursor < menuScrollOffset) {
-                  // Scroll up
-                  menuScrollOffset = settingsCursor;
-              }
-              needRedraw = true;
-          }
-          
-          // DOWN KEY (.)
-          if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
-              settingsCursor++; 
-              if (settingsCursor >= TOTAL_SETTINGS) {
-                  // Wrap to top
-                  settingsCursor = 0;
-                  menuScrollOffset = 0;
-              } else if (settingsCursor >= menuScrollOffset + MAX_MENU_ROWS) {
-                  // Scroll down
-                  menuScrollOffset = settingsCursor - MAX_MENU_ROWS + 1;
-              }
-              needRedraw = true;
-          }
-
-          // LEFT/RIGHT/ENTER LOGIC
-          if (M5Cardputer.Keyboard.isKeyPressed(',') || M5Cardputer.Keyboard.isKeyPressed('/') || M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
-              bool isRight = M5Cardputer.Keyboard.isKeyPressed('/');
-              needRedraw = true;
-              
-              if (settingsCursor == 0) { 
-                  // Brightness
-                  userSettings.brightness += (isRight ? 25 : -25);
-                  if (userSettings.brightness > 255) userSettings.brightness = 255;
-                  if (userSettings.brightness < 5) userSettings.brightness = 5;
-                  M5Cardputer.Display.setBrightness(userSettings.brightness);
-              } 
-              else if (settingsCursor == 1) { 
-                  // Timeout
-                  userSettings.timeoutIndex += (isRight ? 1 : -1);
-                  if (userSettings.timeoutIndex > 4) userSettings.timeoutIndex = 0;
-                  if (userSettings.timeoutIndex < 0) userSettings.timeoutIndex = 4;
-              } 
-              else if (settingsCursor == 2) { 
-                  // Resume Play
-                  userSettings.resumePlay = !userSettings.resumePlay;
-              } 
-              else if (settingsCursor == 3) { 
-                  // DAC Rate
-                  userSettings.spkRateIndex += (isRight ? 1 : -1);
-                  if (userSettings.spkRateIndex > 4) userSettings.spkRateIndex = 0;
-                  if (userSettings.spkRateIndex < 0) userSettings.spkRateIndex = 4;
-                  
-                  // Apply immediately to the hardware
-                  auto spk_cfg = M5Cardputer.Speaker.config();
-                  spk_cfg.sample_rate = sampleRateValues[userSettings.spkRateIndex];
-                  M5Cardputer.Speaker.config(spk_cfg);
-              } 
-              else if (settingsCursor == 4) { 
-                  // Wi-Fi Toggle (Applies on next boot)
-                  userSettings.wifiEnabled = !userSettings.wifiEnabled;
-              } 
-              else if (settingsCursor == 5) { 
-                  // Toggle Wi-Fi Mode (Applies on next boot)
-                  userSettings.isAPMode = !userSettings.isAPMode;
-              }
-              else if (settingsCursor == 6) { 
-                  // Power Saver Toggle (Cycle 0, 1, 2)
-                  userSettings.powerSaverMode += (isRight ? 1 : -1);
-                  if (userSettings.powerSaverMode > 2) userSettings.powerSaverMode = 0;
-                  if (userSettings.powerSaverMode < 0) userSettings.powerSaverMode = 2;
-                  
-                  applyCpuFrequency(); // Apply immediately!
-              }
-              else if (settingsCursor == 7) { 
-                  // --- ENTER WI-FI SETUP ---
-                  M5Cardputer.Display.fillScreen(C_BG_DARK);
-                  M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
-                  M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-                  M5Cardputer.Display.setCursor(5, 5);
-                  M5Cardputer.Display.print("Wi-Fi Setup");
-                  
-                  M5Cardputer.Display.setCursor(10, HEADER_HEIGHT + 20);
-                  M5Cardputer.Display.setTextColor(C_ACCENT);
-                  M5Cardputer.Display.print("Scanning Networks...");
-                  
-                  // Turn on radio and scan
-                  WiFi.mode(WIFI_STA);
-                  WiFi.disconnect();
-                  delay(100);
-                  wifiNetworkCount = WiFi.scanNetworks();
-                  
-                  // Transition to Scanner UI
-                  showSettingsMenu = false;
-                  showWifiScanner = true;
-                  wifiCursor = 0;
-                  wifiScrollOffset = 0;
-                  drawWifiScanner();
-                  return; // Important: Exit so we don't redraw the settings menu!
-              } 
-              else if (settingsCursor == 8) { 
-                  // --- ENTER AP SETUP ---
-                  showSettingsMenu = false;
-                  showTextInput = true;
-                  textInputTarget = 1; // Target: AP SSID
-                  enteredText = userSettings.apSSID;
-                  drawTextInput();
-                  return;
-              }
-              else if (settingsCursor == 9) { 
-                  // Rescan Library
-                  stop_audio();
-                  performFullScan(); 
-                  showSettingsMenu = false; 
-                  currentFileIndex = 0;
-                  if (songOffsets.size() > 0) play_current();
-                  else redrawUI();
-                  return; 
-              }
-              else if (settingsCursor == 10) {
-                  exportConfigToSD();
-                  showSettingsMenu = false;
-                  redrawUI();
-                  return;
-              }
-              else if (settingsCursor == 11) {
-                  importConfigFromSD();
-                  showSettingsMenu = false;
-                  redrawUI();
-                  return;
-              }
-          }
-          
-          if (M5Cardputer.Keyboard.isKeyPressed('`')) {
-              showSettingsMenu = false;
-              saveConfig();
-              redrawUI();
-          }
-          
-          if (needRedraw) drawSettingsMenu();
-          return; 
-      }
-
-      // --- HELP MODE ---
-      if (showHelpPopup) {
-          if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
-              helpScrollOffset--;
-              if (helpScrollOffset < 0) helpScrollOffset = 0;
-              drawHelpPopup();
-          }
-          if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
-              int visibleLines = 5;
-              int maxScroll = helpLines.size() - visibleLines;
-              helpScrollOffset++;
-              if (helpScrollOffset > maxScroll) helpScrollOffset = maxScroll;
-              drawHelpPopup();
-          }
-          if (M5Cardputer.Keyboard.isKeyPressed('i')) {
-              showHelpPopup = false;
-              redrawUI();
-          }
-          return; 
-      }
-
-      // --- MAIN CONTROLS ---
-      if (M5Cardputer.Keyboard.isKeyPressed('`')) {
-          showSettingsMenu = true;
-          drawSettingsMenu();
-          return;
-      }
-      if (M5Cardputer.Keyboard.isKeyPressed('i')) {
-          showHelpPopup = true;
-          drawHelpPopup();
-          return;
-      }
-
-      // --- PLAYLIST NAVIGATION (USING ; and .) ---
-      bool listChanged = false;
-      if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
-          browserIndex--;
-          // Make sure this uses songOffsets!
-          if (browserIndex < 0) browserIndex = songOffsets.size() - 1; 
-          listChanged = true;
-      }
-      if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
-          browserIndex++;
-          // Make sure this uses songOffsets!
-          if (browserIndex >= songOffsets.size()) browserIndex = 0; 
-          listChanged = true;
-      }
-      if (listChanged) {
-          drawPlaylist(); 
-          return;
-      }
-
-      // --- SELECTION / PLAY / PAUSE ---
-      if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
-          if (browserIndex != currentFileIndex) {
-              currentFileIndex = browserIndex;
-              play_current();
-          } else {
-              if (isPaused) resume_audio(); else pause_audio(); 
-          }
-          saveConfig();
-          return;
-      }
-
-      // --- OTHER CONTROLS ---
-      if (M5Cardputer.Keyboard.isKeyPressed('s')) { isShuffle = !isShuffle; drawNowPlayingInfo(); }
-      if (M5Cardputer.Keyboard.isKeyPressed('l')) {
-          if (loopMode == NO_LOOP) loopMode = LOOP_ALL;
-          else if (loopMode == LOOP_ALL) loopMode = LOOP_ONE;
-          else loopMode = NO_LOOP;
-          drawNowPlayingInfo();
-      }
-      if (M5Cardputer.Keyboard.isKeyPressed('v')) {
-          showVisualizer = !showVisualizer;
-          if (!showVisualizer) {
-             visSprite.fillScreen(C_BG_DARK);
-             visSprite.pushSprite(PLAYLIST_WIDTH + 2, HEADER_HEIGHT + 55);
-          }
-      }
-
-      if (M5Cardputer.Keyboard.isKeyPressed('n')) next_song(false);
-      if (M5Cardputer.Keyboard.isKeyPressed('b')) prev_song();
-      if (M5Cardputer.Keyboard.isKeyPressed('/')) seek_audio(5);
-      if (M5Cardputer.Keyboard.isKeyPressed(',')) seek_audio(-5);
-
-      // Volume with [ and ]
-      int v = (int)M5Cardputer.Speaker.getVolume();
-      bool volChanged = false;
-      if (M5Cardputer.Keyboard.isKeyPressed(']')) { v += 10; volChanged = true; }
-      if (M5Cardputer.Keyboard.isKeyPressed('[')) { v -= 10; volChanged = true; }
-      if (volChanged) {
-        if (v > 255) v = 255; if (v < 0) v = 0;
-        M5Cardputer.Speaker.setVolume(v);
-        drawNowPlayingInfo();
-      }
-
-  }
+    }
 }
