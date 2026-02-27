@@ -5,17 +5,23 @@
 #include <M5Unified.h>
 #include <M5Cardputer.h>
 #include <SPI.h>
-
+#include <Preferences.h>
+#include <nvs_flash.h>
 // Audio Libraries
 #include <AudioOutput.h>
 #include <AudioFileSourceSD.h>
 #include <AudioFileSourceID3.h>
 #include <AudioGeneratorMP3.h>
+#include <AudioGeneratorFLAC.h>
+#include <AudioGeneratorAAC.h>
+#include <AudioGeneratorWAV.h> // NEW: WAV Support
+#include <AudioFileSourceBuffer.h>
 #include <WiFi.h>
 #include <WebServer.h>
 
 // --- WEB SERVER ---
 WebServer server(80);
+Preferences preferences;
 // --- AESTHETIC COLORS ---
 #define C_BG_DARK     0x1002  // Gunmetal
 #define C_BG_LIGHT    0x2124  // Panel Grey
@@ -68,7 +74,8 @@ uint32_t paused_at = 0;
 // Audio Objects
 static AudioFileSourceSD *file = nullptr;
 static AudioFileSourceID3 *id3 = nullptr;
-static AudioGeneratorMP3 *mp3 = nullptr;
+static AudioFileSourceBuffer *buff = nullptr; 
+static AudioGenerator *decoder = nullptr;
 class AudioOutputM5Speaker;
 static AudioOutputM5Speaker *out = nullptr;
 
@@ -96,7 +103,7 @@ struct Settings {
 Settings userSettings;
 bool showSettingsMenu = false;
 int settingsCursor = 0; 
-const int TOTAL_SETTINGS = 10;      // Total number of items in the menu
+const int TOTAL_SETTINGS = 12;      // Total number of items in the menu
 const int MAX_MENU_ROWS = 4;       // How many items fit on the screen at once
 int menuScrollOffset = 0;          // Tracks which item is at the top of the menu
 
@@ -120,19 +127,71 @@ const char* timeoutLabels[] = { "Always On", "30 Sec", "1 Min", "2 Min", "5 Min"
 
 // --- CONFIG FUNCTIONS ---
 void saveConfig() {
-    // --- NEW: Always save the position, even if it's paused! ---
+    // Always save the position, even if it's paused
     if (id3) {
         userSettings.lastIndex = currentFileIndex;
         userSettings.lastPos = isPaused ? paused_at : id3->getPos();
     }
     
+    // Open NVS namespace "sam_music" in Read/Write mode (false)
+    preferences.begin("sam_music", false);
+    
+    preferences.putInt("brightness", userSettings.brightness);
+    preferences.putInt("timeoutIndex", userSettings.timeoutIndex);
+    preferences.putBool("resumePlay", userSettings.resumePlay);
+    preferences.putInt("spkRate", userSettings.spkRateIndex);
+    preferences.putInt("lastIndex", userSettings.lastIndex);
+    preferences.putUInt("lastPos", userSettings.lastPos);
+    preferences.putBool("wifiEnabled", userSettings.wifiEnabled);
+    preferences.putString("wifiSSID", userSettings.wifiSSID);
+    preferences.putString("wifiPass", userSettings.wifiPass);
+    preferences.putBool("isAPMode", userSettings.isAPMode);
+    preferences.putString("apSSID", userSettings.apSSID);
+    preferences.putString("apPass", userSettings.apPass);
+    preferences.putInt("powerMode", userSettings.powerSaverMode);
+    
+    preferences.end();
+}
+
+void loadConfig() {
+    // Open NVS namespace in Read-Only mode (true)
+    preferences.begin("sam_music", true);
+    
+    // The second parameter is the default value if the key doesn't exist yet
+    userSettings.brightness = preferences.getInt("brightness", 100);
+    userSettings.timeoutIndex = preferences.getInt("timeoutIndex", 0);
+    userSettings.resumePlay = preferences.getBool("resumePlay", true);
+    userSettings.spkRateIndex = preferences.getInt("spkRate", 4);
+    userSettings.lastIndex = preferences.getInt("lastIndex", 0);
+    userSettings.lastPos = preferences.getUInt("lastPos", 0);
+    userSettings.wifiEnabled = preferences.getBool("wifiEnabled", false);
+    userSettings.wifiSSID = preferences.getString("wifiSSID", "");
+    userSettings.wifiPass = preferences.getString("wifiPass", "");
+    userSettings.isAPMode = preferences.getBool("isAPMode", false);
+    userSettings.apSSID = preferences.getString("apSSID", "Cardputer");
+    userSettings.apPass = preferences.getString("apPass", "12345678");
+    userSettings.powerSaverMode = preferences.getInt("powerMode", 0);
+    
+    preferences.end();
+
+    // Failsafe defaults
+    if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
+    if(userSettings.apPass.length() < 8) userSettings.apPass = "12345678";
+    if (userSettings.brightness < 5) userSettings.brightness = 5;
+    if (userSettings.brightness > 255) userSettings.brightness = 255;
+    if (userSettings.timeoutIndex < 0 || userSettings.timeoutIndex > 4) userSettings.timeoutIndex = 0;
+
+    applyCpuFrequency();
+}
+
+void exportConfigToSD() {
     if (SD.exists(CONFIG_FILE)) SD.remove(CONFIG_FILE);
     File file = SD.open(CONFIG_FILE, FILE_WRITE);
     if (file) {
         file.println(userSettings.brightness);
         file.println(userSettings.timeoutIndex);
         file.println(userSettings.resumePlay ? 1 : 0);
-        file.println(userSettings.spkRateIndex); // Your new hardware rate
+        file.println(userSettings.spkRateIndex);
         file.println(userSettings.lastIndex);
         file.println(userSettings.lastPos);
         file.println(userSettings.wifiEnabled ? 1 : 0);
@@ -143,11 +202,25 @@ void saveConfig() {
         file.println(userSettings.apPass);
         file.println(userSettings.powerSaverMode);
         file.close();
+        
+        M5Cardputer.Display.fillScreen(C_BG_DARK);
+        M5Cardputer.Display.setCursor(10, 40);
+        M5Cardputer.Display.setTextColor(C_PLAYING);
+        M5Cardputer.Display.print("Exported to SD!");
+        delay(1000);
     }
 }
 
-void loadConfig() {
-    if (!SD.exists(CONFIG_FILE)) return;
+void importConfigFromSD() {
+    if (!SD.exists(CONFIG_FILE)) {
+        M5Cardputer.Display.fillScreen(C_BG_DARK);
+        M5Cardputer.Display.setCursor(10, 40);
+        M5Cardputer.Display.setTextColor(TFT_RED);
+        M5Cardputer.Display.print("No config.txt found!");
+        delay(1000);
+        return;
+    }
+    
     File file = SD.open(CONFIG_FILE);
     if (file) {
         if(file.available()) userSettings.brightness = file.readStringUntil('\n').toInt();
@@ -163,15 +236,17 @@ void loadConfig() {
         if(file.available()) { userSettings.apSSID = file.readStringUntil('\n'); userSettings.apSSID.trim(); }
         if(file.available()) { userSettings.apPass = file.readStringUntil('\n'); userSettings.apPass.trim(); }
         if(file.available()) userSettings.powerSaverMode = file.readStringUntil('\n').toInt();
-
-        // Failsafe defaults if the text gets wiped
-        if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
-        if(userSettings.apPass.length() < 8) userSettings.apPass = "12345678";
-        if (userSettings.brightness < 5) userSettings.brightness = 5;
-        if (userSettings.brightness > 255) userSettings.brightness = 255;
-        if (userSettings.timeoutIndex < 0 || userSettings.timeoutIndex > 4) userSettings.timeoutIndex = 0;
         file.close();
+        
+        saveConfig(); // Commit the imported settings to internal NVS
         applyCpuFrequency();
+        M5Cardputer.Display.setBrightness(userSettings.brightness);
+        
+        M5Cardputer.Display.fillScreen(C_BG_DARK);
+        M5Cardputer.Display.setCursor(10, 40);
+        M5Cardputer.Display.setTextColor(C_PLAYING);
+        M5Cardputer.Display.print("Imported from SD!");
+        delay(1000);
     }
 }
 
@@ -194,7 +269,7 @@ void applyCpuFrequency() {
     }
 }
 
-// 1. The HTML Web UI
+// 1. The HTML Web UI (Now with Cover Art & Metadata Parsing!)
 void handleRoot() {
     String html = R"rawliteral(
     <!DOCTYPE html>
@@ -203,6 +278,9 @@ void handleRoot() {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Sam Music Player</title>
+        
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js"></script>
+        
         <style>
             :root {
                 --bg-dark: #15181C;
@@ -216,8 +294,20 @@ void handleRoot() {
             h1 { color: var(--cyan); text-align: center; font-weight: 300; letter-spacing: 2px; }
             
             /* Sticky Player Header */
-            .player-card { background: var(--bg-light); padding: 20px; border-radius: 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.6); text-align: center; position: sticky; top: 10px; z-index: 100; border: 1px solid #333;}
-            #now-playing { font-size: 1.2em; margin-bottom: 15px; color: var(--green); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: bold;}
+            .player-card { background: var(--bg-light); padding: 20px; border-radius: 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.6); position: sticky; top: 10px; z-index: 100; border: 1px solid #333;}
+            
+            /* Now Playing Layout (Cover Art + Text side-by-side) */
+            .now-playing-container { display: flex; align-items: center; gap: 20px; margin-bottom: 20px; }
+            
+            .cover-wrapper { width: 100px; height: 100px; flex-shrink: 0; background: var(--bg-dark); border-radius: 8px; display: flex; justify-content: center; align-items: center; overflow: hidden; border: 1px solid var(--slate-blue); box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+            #cover-art { width: 100%; height: 100%; object-fit: cover; display: none; }
+            #cover-placeholder { color: var(--slate-blue); font-size: 30px; }
+            
+            .track-details { flex-grow: 1; overflow: hidden; }
+            #track-title { font-size: 1.3em; color: var(--green); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: bold; margin-bottom: 4px; }
+            #track-artist { font-size: 1em; color: var(--cyan); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px; }
+            #track-album { font-size: 0.85em; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
             audio { width: 100%; margin-bottom: 15px; outline: none; border-radius: 5px; height: 40px; }
             
             /* Transport Controls */
@@ -226,15 +316,21 @@ void handleRoot() {
             button:hover { background: var(--cyan); color: var(--bg-dark); transform: scale(1.05); }
             button.active { background: var(--magenta); color: white; }
             
+            /* Search Bar */
+            .search-box { margin-top: 25px; text-align: center; }
+            #searchBar { width: 100%; padding: 12px 20px; border-radius: 25px; border: 1px solid var(--slate-blue); background: var(--bg-dark); color: white; font-size: 16px; outline: none; transition: 0.3s; box-sizing: border-box;}
+            #searchBar:focus { border-color: var(--cyan); box-shadow: 0 0 8px rgba(0, 229, 255, 0.4); background: var(--bg-light); }
+            
             /* Playlist */
-            ul { list-style: none; padding: 0; margin-top: 25px;}
+            ul { list-style: none; padding: 0; margin-top: 20px;}
             li { display: flex; justify-content: space-between; align-items: center; background: var(--bg-light); margin-bottom: 8px; border-radius: 6px; transition: 0.2s; border-left: 4px solid transparent; }
             li:hover { background: var(--slate-blue); }
-            li.playing { background: #1A2933; border-left: 4px solid var(--cyan); color: var(--cyan); font-weight: bold; }
+            li.playing { background: #1A2933; border-left: 4px solid var(--cyan); }
             
             .song-info { flex-grow: 1; padding: 14px; cursor: pointer; display: flex; align-items: center; }
             .track-num { color: #888; margin-right: 15px; font-size: 0.85em; width: 25px; text-align: right; }
-            li.playing .track-num { color: var(--cyan); }
+            li.playing .track-num { color: var(--cyan); font-weight: bold;}
+            li.playing .track-name { color: var(--cyan); font-weight: bold;}
             
             /* Download Button */
             .dl-btn { background: #333; color: white; text-decoration: none; padding: 8px 12px; border-radius: 4px; margin-right: 10px; font-size: 1.1em; transition: 0.2s; }
@@ -245,8 +341,20 @@ void handleRoot() {
         <h1>SAM MUSIC PLAYER</h1>
         
         <div class="player-card">
-            <div id="now-playing">Select a song to start</div>
+            <div class="now-playing-container">
+                <div class="cover-wrapper">
+                    <div id="cover-placeholder">🎵</div>
+                    <img id="cover-art" src="" alt="Cover Art">
+                </div>
+                <div class="track-details">
+                    <div id="track-title">Select a song to start</div>
+                    <div id="track-artist">Waiting for selection...</div>
+                    <div id="track-album"></div>
+                </div>
+            </div>
+
             <audio id="player" controls></audio>
+            
             <div class="controls">
                 <button id="btnPrev" title="Previous Song">⏮</button>
                 <button id="btnNext" title="Next Song">⏭</button>
@@ -255,21 +363,31 @@ void handleRoot() {
             </div>
         </div>
 
+        <div class="search-box">
+            <input type="text" id="searchBar" placeholder="Search for old Bollywood classics, artists, or albums...">
+        </div>
+
         <ul id="playlist"><li>Loading library from SD...</li></ul>
 
         <script>
             let songs = [];
             let currentIndex = -1;
             let isShuffle = false;
-            let loopMode = 0; // 0: All, 1: One
+            let loopMode = 0;
             
             const player = document.getElementById('player');
             const btnPrev = document.getElementById('btnPrev');
             const btnNext = document.getElementById('btnNext');
             const btnShuffle = document.getElementById('btnShuffle');
             const btnLoop = document.getElementById('btnLoop');
-            const nowPlaying = document.getElementById('now-playing');
             const playlistEl = document.getElementById('playlist');
+            const searchBar = document.getElementById('searchBar');
+
+            const titleEl = document.getElementById('track-title');
+            const artistEl = document.getElementById('track-artist');
+            const albumEl = document.getElementById('track-album');
+            const coverArt = document.getElementById('cover-art');
+            const coverPlaceholder = document.getElementById('cover-placeholder');
 
             // Fetch Library
             fetch('/api/songs').then(r => r.json()).then(data => {
@@ -278,18 +396,17 @@ void handleRoot() {
                 songs.forEach((song, idx) => {
                     let li = document.createElement('li');
                     li.id = 'song-' + idx;
+                    li.className = 'song-item';
                     
-                    // Clickable area to play the song
                     let infoDiv = document.createElement('div');
                     infoDiv.className = 'song-info';
                     infoDiv.innerHTML = `<span class="track-num">${idx + 1}</span> <span class="track-name">${song}</span>`;
                     infoDiv.onclick = () => playSong(idx);
                     
-                    // Direct Download Link
                     let dlLink = document.createElement('a');
                     dlLink.className = 'dl-btn';
                     dlLink.href = '/download?id=' + idx;
-                    dlLink.title = 'Download MP3';
+                    dlLink.title = 'Download Audio';
                     dlLink.innerText = '💾';
                     
                     li.appendChild(infoDiv);
@@ -299,27 +416,84 @@ void handleRoot() {
             }).catch(err => {
                 playlistEl.innerHTML = '<li style="color:red; padding:15px;">Error loading library. Ensure SD card is inserted.</li>';
             });
-
-            // Core Playback Logic
+            // Real-time Search Logic
+            searchBar.addEventListener('input', (e) => {
+                const term = e.target.value.toLowerCase();
+                const items = playlistEl.getElementsByClassName('song-item');
+                Array.from(items).forEach(item => {
+                    const songName = item.querySelector('.track-name').innerText.toLowerCase();
+                    item.style.display = songName.includes(term) ? 'flex' : 'none';
+                });
+            });
+            // Core Playback & Metadata Logic
             function playSong(index) {
                 if (index < 0 || index >= songs.length) return;
-                
                 if (currentIndex !== -1) {
                     let oldLi = document.getElementById('song-' + currentIndex);
                     if(oldLi) oldLi.classList.remove('playing');
                 }
-                
                 currentIndex = index;
-                
                 let newLi = document.getElementById('song-' + currentIndex);
                 if(newLi) {
                     newLi.classList.add('playing');
                     newLi.scrollIntoView({ behavior: 'smooth', block: 'center' }); 
                 }
-                
-                nowPlaying.innerText = songs[currentIndex];
-                player.src = '/stream?id=' + currentIndex;
-                player.play();
+                const fileUrl = '/stream?id=' + currentIndex;
+                const metaUrl = fileUrl + '&meta=1';
+                const fallbackName = songs[currentIndex];
+                // 1. CLEAR AUDIO SOURCE FIRST
+                // This forces the browser to drop the previous connection, freeing the ESP32
+                player.src = ''; 
+                // 2. RESET UI
+                titleEl.innerText = 'Loading...';
+                artistEl.innerText = '';
+                albumEl.innerText = '';
+                coverArt.style.display = 'none';
+                coverPlaceholder.style.display = 'block';
+                // 3. FETCH METADATA CHUNK (640KB)
+                fetch(metaUrl)
+                    .then(res => res.blob())
+                    .then(blob => {
+                        window.jsmediatags.read(blob, {
+                            onSuccess: function(tag) {
+                                const tags = tag.tags;
+                                titleEl.innerText = tags.title || fallbackName;
+                                artistEl.innerText = tags.artist || 'Unknown Artist';
+                                albumEl.innerText = tags.album || '';
+
+                                // Lightning-fast Image Rendering using Object URLs
+                                if (tags.picture) {
+                                    try {
+                                        const byteArray = new Uint8Array(tags.picture.data);
+                                        const imgBlob = new Blob([byteArray], { type: tags.picture.format });
+                                        coverArt.src = URL.createObjectURL(imgBlob);
+                                        coverArt.style.display = 'block';
+                                        coverPlaceholder.style.display = 'none';
+                                    } catch (e) {
+                                        console.error("Error decoding image:", e);
+                                    }
+                                }
+                                
+                                // 4. START PLAYBACK
+                                player.src = fileUrl;
+                                player.play();
+                            },
+                            onError: function(error) {
+                                console.error('jsmediatags Error:', error.info);
+                                titleEl.innerText = fallbackName;
+                                artistEl.innerText = 'Unknown Artist';
+                                player.src = fileUrl;
+                                player.play();
+                            }
+                        });
+                    })
+                    .catch(err => {
+                        console.error('Fetch Error:', err);
+                        titleEl.innerText = fallbackName;
+                        artistEl.innerText = 'Unknown Artist';
+                        player.src = fileUrl;
+                        player.play();
+                    });
             }
 
             function playNext() {
@@ -361,7 +535,6 @@ void handleRoot() {
                 btnLoop.classList.toggle('active', loopMode === 1);
             };
 
-            // Auto-advance
             player.addEventListener('ended', playNext);
         </script>
     </body>
@@ -394,29 +567,71 @@ void handleDownload() {
     server.streamFile(f, "audio/mpeg");
     f.close();
 }
-// 2. Stream the Playlist as JSON without crashing RAM
+// 2. Stream the Playlist as JSON without crashing RAM or thrashing the SD Card
 void handleSongList() {
+    if (!SD.exists(PLAYLIST_FILE)) {
+        server.send(500, "text/plain", "Playlist not found");
+        return;
+    }
+
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/json", "");
-    server.sendContent("[");
-    
-    for (size_t i = 0; i < songOffsets.size(); i++) {
-        String path = getSongPath(i);
-        // Extract just the filename to make the web UI look clean
-        int slashIdx = path.lastIndexOf('/');
-        if (slashIdx >= 0) path = path.substring(slashIdx + 1);
-        
-        String item = "\"" + path + "\"";
-        if (i < songOffsets.size() - 1) item += ",";
-        
-        server.sendContent(item); // Send chunk
+    server.sendContent("[\n");
+
+    File file = SD.open(PLAYLIST_FILE);
+    if (!file) {
+        server.sendContent("]");
+        server.sendContent("");
+        return;
     }
-    
-    server.sendContent("]");
+
+    String jsonBuffer = "";
+    bool firstItem = true;
+
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim(); // Clean up carriage returns
+        if (line.length() == 0) continue;
+        
+        // Only process valid audio files based on our supported extensions
+        String lineLower = line;
+        lineLower.toLowerCase();
+        if (lineLower.endsWith(".mp3") || lineLower.endsWith(".flac") || 
+            lineLower.endsWith(".m4a") || lineLower.endsWith(".aac") || lineLower.endsWith(".wav")) {
+            
+            // Extract just the filename to make the web UI look clean
+            int slashIdx = line.lastIndexOf('/');
+            if (slashIdx >= 0) line = line.substring(slashIdx + 1);
+
+            // CRITICAL: Escape double quotes in filenames to prevent JSON breaking
+            line.replace("\"", "\\\"");
+
+            if (!firstItem) {
+                jsonBuffer += ",\n";
+            }
+            jsonBuffer += "\"" + line + "\"";
+            firstItem = false;
+
+            // Send in chunks of ~1KB to optimize TCP packets and save RAM
+            if (jsonBuffer.length() > 1024) {
+                server.sendContent(jsonBuffer);
+                jsonBuffer = ""; // Reset buffer
+            }
+        }
+    }
+    file.close();
+
+    // Send any remaining data left in the buffer
+    if (jsonBuffer.length() > 0) {
+        server.sendContent(jsonBuffer);
+    }
+
+    server.sendContent("\n]");
     server.sendContent(""); // Empty string terminates the chunked response
 }
 
 // 3. Stream the raw MP3 file to the laptop browser
+// 3. Stream the raw audio file OR a metadata chunk to the browser
 void handleStream() {
     if (!server.hasArg("id")) {
         server.send(400, "text/plain", "Missing song ID");
@@ -431,8 +646,32 @@ void handleStream() {
         server.send(404, "text/plain", "File not found");
         return;
     }
-    
-    // This pipes the file directly from SD to Wi-Fi!
+
+    // --- METADATA CHUNK LOGIC ---
+    // If the browser only wants to read ID3 tags, send the first 128KB and close.
+    // This prevents the ESP32 from getting locked up!
+    if (server.hasArg("meta")) {
+        size_t chunkSize = 655360; // 128KB is enough for high-res cover art
+        if (f.size() < chunkSize) chunkSize = f.size(); 
+        
+        server.setContentLength(chunkSize);
+        server.send(200, "audio/mpeg", "");
+        
+        uint8_t buffer[2048];
+        size_t remaining = chunkSize;
+        
+        while (f.available() && remaining > 0) {
+            size_t toRead = (remaining < sizeof(buffer)) ? remaining : sizeof(buffer);
+            size_t bytesRead = f.read(buffer, toRead);
+            if (bytesRead == 0) break;
+            server.client().write(buffer, bytesRead);
+            remaining -= bytesRead;
+        }
+        f.close();
+        return;
+    }
+
+    // --- NORMAL AUDIO STREAM ---
     server.streamFile(f, "audio/mpeg");
     f.close();
 }
@@ -605,7 +844,7 @@ class AudioOutputM5Speaker : public AudioOutput {
   protected:
     m5::Speaker_Class* _m5sound;
     uint8_t _virtual_ch;
-    static constexpr size_t tri_buf_size = 640;
+    static constexpr size_t tri_buf_size = 2048;
     int16_t _tri_buffer[3][tri_buf_size];
     size_t _tri_buffer_index = 0;
     size_t _tri_index = 0;
@@ -706,7 +945,9 @@ bool loadPlaylist() {
         line.trim(); // Clean up hidden carriage returns
         
         // 3. ONLY save the offset if it's an actual audio file
-        if (line.length() > 0 && (line.endsWith(".mp3") || line.endsWith(".MP3"))) {
+        String lineLower = line;
+        lineLower.toLowerCase();
+        if (lineLower.length() > 0 && (lineLower.endsWith(".mp3") || lineLower.endsWith(".flac") || lineLower.endsWith(".m4a") || lineLower.endsWith(".aac")) || lineLower.endsWith(".wav")) {
             songOffsets.push_back(pos);
         }
     }
@@ -728,7 +969,9 @@ void listDir(fs::FS &fs, const char *dirname, uint8_t levels, File &playlistFile
         } else {
             String filename = file.name();
             String filepath = file.path();
-            if (filename.endsWith(".mp3") || filename.endsWith(".MP3")) {
+            String filenameLower = filename;
+            filenameLower.toLowerCase();
+            if (filenameLower.endsWith(".mp3") || filenameLower.endsWith(".flac") || filenameLower.endsWith(".m4a") || filenameLower.endsWith(".aac") || filenameLower.endsWith(".wav")) {
                 playlistFile.println(filepath); // Write directly to SD
                 
                 // Keep the UI updated
@@ -821,12 +1064,55 @@ void drawPlaylist() {
 }
 
 void drawBottomBar() {
-  int yPos = M5Cardputer.Display.height() - BOTTOM_BAR_HEIGHT;
-  M5Cardputer.Display.fillRect(0, yPos, M5Cardputer.Display.width(), BOTTOM_BAR_HEIGHT, C_HEADER);
-  M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
-  M5Cardputer.Display.setFont(&fonts::Font0);
-  M5Cardputer.Display.setCursor(5, yPos + 4);
-  M5Cardputer.Display.print("Enter:Play  ;/.:Scroll  I:info");
+    int yPos = M5Cardputer.Display.height() - BOTTOM_BAR_HEIGHT;
+    
+    // Draw the base bottom bar background
+    M5Cardputer.Display.fillRect(0, yPos, M5Cardputer.Display.width(), BOTTOM_BAR_HEIGHT, C_HEADER);
+    
+    // Draw the instructions
+    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+    M5Cardputer.Display.setFont(&fonts::Font0);
+    M5Cardputer.Display.setCursor(5, yPos + 4);
+    M5Cardputer.Display.print("Enter:Play  ;/.:Scroll  I:info");
+
+    // --- NEW: Dynamic Codec Badge ---
+    if (songOffsets.size() > 0) {
+        String fname = getSongPath(currentFileIndex);
+        fname.toLowerCase();
+        
+        String codecText = "MP3";
+        uint16_t codecColor = C_ACCENT; // Cyan for MP3
+        
+        if (fname.endsWith(".flac")) {
+            codecText = "FLAC";
+            codecColor = C_PLAYING;     // Green for FLAC (Lossless!)
+        } else if (fname.endsWith(".m4a") || fname.endsWith(".aac")) {
+            codecText = "AAC";
+            codecColor = C_HIGHLIGHT;   // Magenta for AAC
+        }else if (fname.endsWith(".wav")) {
+            codecText = "WAV";
+            codecColor = TFT_ORANGE;    // Orange for WAV
+        }
+
+        // Badge Dimensions and Positioning
+        int boxW = 36;
+        int boxH = 14;
+        int boxX = M5Cardputer.Display.width() - boxW - 2; // 2px margin from the right edge
+        int boxY = yPos + 2;                               // Centered vertically in the 18px bar
+
+        // Draw the badge background
+        M5Cardputer.Display.fillRoundRect(boxX, boxY, boxW, boxH, 3, codecColor);
+        
+        // Draw the dark text inside the badge
+        M5Cardputer.Display.setTextColor(C_BG_DARK); 
+        
+        // Center the text dynamically based on the string length
+        int textWidth = M5Cardputer.Display.textWidth(codecText.c_str());
+        int textX = boxX + ((boxW - textWidth) / 2);
+        
+        M5Cardputer.Display.setCursor(textX, boxY + 3);
+        M5Cardputer.Display.print(codecText);
+    }
 }
 
 int lastProgressWidth = -1;
@@ -908,9 +1194,9 @@ void MDCallback(void *cbData, const char *type, bool isUnicode, const char *stri
   }
 }
 
-void drawVisualizer() {
-  if (!mp3 || !mp3->isRunning() || isPaused) return;
 
+  void drawVisualizer() {
+  if (!decoder || !decoder->isRunning() || isPaused) return;
   auto buf = out->getBuffer();
   if (buf) {
     memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t));
@@ -1025,18 +1311,20 @@ void drawSettingsMenu() {
         }
 
         // Content logic
+// Content logic
         switch (idx) {
             case 0: M5Cardputer.Display.printf("Brightness: %d", userSettings.brightness); break;
             case 1: M5Cardputer.Display.printf("Screen Off: %s", timeoutLabels[userSettings.timeoutIndex]); break;
             case 2: M5Cardputer.Display.printf("Resume Play: %s", userSettings.resumePlay ? "ON" : "OFF"); break;
             case 3: M5Cardputer.Display.printf("DAC Rate: %s", sampleRateLabels[userSettings.spkRateIndex]); break;
             case 4: M5Cardputer.Display.printf("Wi-Fi Power: %s", userSettings.wifiEnabled ? "ON" : "OFF"); break;
-            case 5: M5Cardputer.Display.printf("Wi-Fi Mode: %s", userSettings.isAPMode ? "AP (Host)" : "STA (Client)"); break; // <-- NEW
+            case 5: M5Cardputer.Display.printf("Wi-Fi Mode: %s", userSettings.isAPMode ? "AP (Host)" : "STA (Client)"); break; 
             case 6: M5Cardputer.Display.printf("Power Saver: %s", powerModeLabels[userSettings.powerSaverMode]); break;
-            case 7: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; // Moved down
+            case 7: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; 
             case 8: M5Cardputer.Display.print("> Setup AP (Host)"); break;
-            case 9: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    // Moved down
-            
+            case 9: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    
+            case 10: M5Cardputer.Display.print("[ EXPORT CONFIG TO SD ]"); break; // <-- NEW
+            case 11: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;      // <-- NEW
         }
     }
 
@@ -1065,8 +1353,9 @@ void redrawUI() {
 
 // --- AUDIO LOGIC ---
 void stop_audio() {
-  if (mp3) { mp3->stop(); delete mp3; mp3 = nullptr; }
+  if (decoder) { decoder->stop(); delete decoder; decoder = nullptr; }
   if (id3) { id3->close(); delete id3; id3 = nullptr; }
+  if (buff) { buff->close(); delete buff; buff = nullptr; } // Clean up buffer
   if (file) { file->close(); delete file; file = nullptr; }
 }
 
@@ -1094,7 +1383,9 @@ void play_current(uint32_t startPos = 0) { // <-- NEW: Takes an optional startin
   }
 
   file = new AudioFileSourceSD(fname.c_str());
-  id3 = new AudioFileSourceID3(file);
+  // Create a 16KB pre-fetch buffer in RAM to prevent SD card stutter
+  buff = new AudioFileSourceBuffer(file, 16384); 
+  id3 = new AudioFileSourceID3(buff); // Note: ID3 now reads from buff, not file
   id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
   
   // --- NEW: Seek the file BEFORE turning on the MP3 decoder ---
@@ -1102,16 +1393,28 @@ void play_current(uint32_t startPos = 0) { // <-- NEW: Takes an optional startin
       id3->seek(startPos, 1);
   }
   
-  mp3 = new AudioGeneratorMP3();
-  mp3->begin(id3, out);
+// Route to the correct decoder based on extension
+  String fnameLower = fname;
+  fnameLower.toLowerCase();
+  
+  if (fnameLower.endsWith(".flac")) {
+      decoder = new AudioGeneratorFLAC();
+  } else if (fnameLower.endsWith(".m4a") || fnameLower.endsWith(".aac")) {
+      decoder = new AudioGeneratorAAC();
+  } else if (fnameLower.endsWith(".wav")) {
+      decoder = new AudioGeneratorWAV(); // NEW: Uncompressed WAV
+  } else {
+      decoder = new AudioGeneratorMP3();
+  }
+  decoder->begin(id3, out);
   isPaused = false;
   drawNowPlayingInfo();
 }
 
 void pause_audio() {
-  if (mp3 && mp3->isRunning()) {
+  if (decoder && decoder->isRunning()) {
     paused_at = id3->getPos();
-    mp3->stop();
+    decoder->stop();
     isPaused = true;
     drawNowPlayingInfo();
   }
@@ -1136,7 +1439,9 @@ void resume_audio() {
 
   // 3. Restart the audio stream
   file = new AudioFileSourceSD(fname.c_str());
-  id3 = new AudioFileSourceID3(file);
+  // Create a 16KB pre-fetch buffer in RAM to prevent SD card stutter
+  buff = new AudioFileSourceBuffer(file, 16384); 
+  id3 = new AudioFileSourceID3(buff); // Note: ID3 now reads from buff, not file
   id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
   
   // Jump back to where we paused
@@ -1144,8 +1449,21 @@ void resume_audio() {
       id3->seek(paused_at, 1);
   }
   
-  mp3 = new AudioGeneratorMP3();
-  mp3->begin(id3, out);
+// Route to the correct decoder based on extension
+  String fnameLower = fname;
+  fnameLower.toLowerCase();
+  
+  if (fnameLower.endsWith(".flac")) {
+      decoder = new AudioGeneratorFLAC();
+  } else if (fnameLower.endsWith(".m4a") || fnameLower.endsWith(".aac")) {
+      decoder = new AudioGeneratorAAC();
+  } else if (fnameLower.endsWith(".wav")) {
+      decoder = new AudioGeneratorWAV(); // NEW: Uncompressed WAV
+  } else {
+      decoder = new AudioGeneratorMP3();
+  }
+
+  decoder->begin(id3, out);
   isPaused = false;
   drawNowPlayingInfo();
 }
@@ -1198,7 +1516,8 @@ void prev_song() {
 }
 
 void seek_audio(int seconds) {
-    if (!mp3 || !mp3->isRunning() || !id3) return;
+    if (!decoder || !decoder->isRunning() || !id3) return;
+    
     uint32_t currentPos = id3->getPos();
     uint32_t fileSize = id3->getSize();
     int32_t jumpBytes = seconds * 16000;
@@ -1209,22 +1528,64 @@ void seek_audio(int seconds) {
     stop_audio();
     String fname = getSongPath(currentFileIndex);
     file = new AudioFileSourceSD(fname.c_str());
-    id3 = new AudioFileSourceID3(file);
+    // Create a 16KB pre-fetch buffer in RAM to prevent SD card stutter
+    buff = new AudioFileSourceBuffer(file, 16384); 
+    id3 = new AudioFileSourceID3(buff); // Note: ID3 now reads from buff, not file
     id3->RegisterMetadataCB(MDCallback, (void*)"ID3TAG");
     id3->seek(newPos, 1);
-    mp3 = new AudioGeneratorMP3();
-    mp3->begin(id3, out);
+    
+    // Route to the correct decoder
+    String fnameLower = fname;
+    fnameLower.toLowerCase();
+    if (fnameLower.endsWith(".flac")) decoder = new AudioGeneratorFLAC();
+    else if (fnameLower.endsWith(".m4a") || fnameLower.endsWith(".aac")) decoder = new AudioGeneratorAAC();
+    else if (fnameLower.endsWith(".wav")) decoder = new AudioGeneratorWAV(); // NEW: Uncompressed WAV
+    else decoder = new AudioGeneratorMP3();
+    
+    decoder->begin(id3, out);
 }
-
+void initNVS() {
+    // Attempt to initialize NVS
+    esp_err_t err = nvs_flash_init();
+    
+    // Check if the NVS partition is corrupted or contains a new/unrecognized version
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        
+        M5Cardputer.Display.fillScreen(C_BG_DARK);
+        M5Cardputer.Display.setCursor(10, 40);
+        M5Cardputer.Display.setTextColor(TFT_ORANGE);
+        M5Cardputer.Display.print("NVS Corrupted! Reformatting...");
+        
+        // Wipe the NVS partition clean
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        
+        // Try initializing again
+        err = nvs_flash_init();
+        delay(1000); 
+    }
+    
+    // If it STILL fails, print an error (but don't crash)
+    if (err != ESP_OK) {
+        M5Cardputer.Display.fillScreen(C_BG_DARK);
+        M5Cardputer.Display.setCursor(10, 40);
+        M5Cardputer.Display.setTextColor(TFT_RED);
+        M5Cardputer.Display.printf("NVS Init Failed: %s", esp_err_to_name(err));
+        delay(2000);
+    }
+}
 // --- SETUP ---
 void setup() {
   auto cfg = M5.config();
   cfg.external_speaker.hat_spk = true;
   M5Cardputer.begin(cfg);
-  M5Cardputer.Power.setBatteryCharge(true);
+//   M5Cardputer.Power.setBatteryCharge(true);
+    initNVS();
   auto spk_cfg = M5Cardputer.Speaker.config();
   spk_cfg.sample_rate = 128000;
   spk_cfg.task_pinned_core = APP_CPU_NUM;
+  spk_cfg.dma_buf_count = 8;              // NEW: Increased DMA buffers
+  spk_cfg.dma_buf_len = 256;              // NEW: Increased DMA chunk size
+  spk_cfg.task_priority = 3;              // NEW: Higher priority for audio task    
   M5Cardputer.Speaker.config(spk_cfg);
   out = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
 
@@ -1398,9 +1759,9 @@ void loop() {
   }
 
   // Audio Loop
-  if (mp3 && mp3->isRunning()) {
-    if (!mp3->loop()) {
-      mp3->stop();
+  if (decoder && decoder->isRunning()) {
+    if (!decoder->loop()) {
+      decoder->stop();
       next_song(true); 
       if(userSettings.resumePlay) saveConfig();
     }
@@ -1646,6 +2007,18 @@ void loop() {
                   else redrawUI();
                   return; 
               }
+              else if (settingsCursor == 10) {
+                  exportConfigToSD();
+                  showSettingsMenu = false;
+                  redrawUI();
+                  return;
+              }
+              else if (settingsCursor == 11) {
+                  importConfigFromSD();
+                  showSettingsMenu = false;
+                  redrawUI();
+                  return;
+              }
           }
           
           if (M5Cardputer.Keyboard.isKeyPressed('`')) {
@@ -1753,5 +2126,6 @@ void loop() {
         M5Cardputer.Speaker.setVolume(v);
         drawNowPlayingInfo();
       }
+
   }
 }
