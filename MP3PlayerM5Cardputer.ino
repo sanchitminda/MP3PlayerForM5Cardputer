@@ -1,5 +1,6 @@
 ///////////////////////////////////////////////
 /// Made by: Sanchit Minda() | Github/sanchitminda
+/// Fully Functional OOP & State Machine Architecture
 //////////////////////////////////////////////
 #include <vector>
 #include <M5Unified.h>
@@ -51,6 +52,8 @@ uint16_t C_BG_DARK, C_BG_LIGHT, C_HEADER, C_ACCENT, C_PLAYING, C_HIGHLIGHT, C_TE
 
 const int NUM_THEMES = 4;
 const char* themeLabels[] = { "Gunmetal Blue", "Cyberpunk", "Retro Amber", "Hacker Green" };
+const int NUM_VIS_MODES = 4;
+const char* visModeLabels[] = { "Classic Bars", "Waveform Line", "Circular Spikes", "OFF" };
 
 void applyTheme(int index) {
     switch(index) {
@@ -101,15 +104,22 @@ const char* helpLines[] = {
   "settings to access.",
   "Power Saver: Underclock",
   "CPU to save battery life.",
+  "",
   "--- POCKET MODE ---",
   "Btn A (1 Click): Play/Pause",
   "Btn A (2 Clicks): Next",
   "Btn A (3 Clicks): Prev",
   "Press any key to wake screen",
+  "--- ABOUT ---",
+  "Made with <3 by SaM",
+  "Sit back, relax, and",
+  "enjoy the music!",
   "---",
-  "GH: github.com/sanchitminda"
+  "GH: github.com/sanchitminda",
+  "Share your suggestions!"
 };
-const int numHelpLines = 22;
+const int numHelpLines = 28;
+const int numSettings = 14;
 
 // ==========================================
 // GLOBALS
@@ -117,6 +127,7 @@ const int numHelpLines = 22;
 struct Settings {
     int brightness = 100;      
     int themeIndex = 0;
+    int visMode = 0; // NEW: 0=Bars, 1=Line, 2=Circle
     int timeoutIndex = 0;      
     bool resumePlay = true;    
     int spkRateIndex = 4;      
@@ -229,6 +240,7 @@ public:
         userSettings.apPass = preferences.getString("apPass", "12345678");
         userSettings.powerSaverMode = preferences.getInt("powerMode", 0);
         userSettings.themeIndex = preferences.getInt("themeIndex", 0);
+        userSettings.visMode = preferences.getInt("visMode", 0);
         preferences.end();
         
         if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
@@ -252,6 +264,7 @@ public:
         preferences.putString("apPass", userSettings.apPass);
         preferences.putInt("powerMode", userSettings.powerSaverMode);
         preferences.putInt("themeIndex", userSettings.themeIndex);
+        preferences.putInt("visMode", userSettings.visMode);
         preferences.end();
     }
 
@@ -325,6 +338,7 @@ public:
     uint32_t paused_at = 0;
     String currentTitle = "";
     String currentArtist = "";
+    String currentAlbum = "";
 
     void listDir(fs::FS &fs, const char *dirname, uint8_t levels, File &playlistFile) {
         File root = fs.open(dirname); if (!root || !root.isDirectory()) return;
@@ -385,7 +399,7 @@ public:
 
     bool play(int index, uint32_t startPos = 0) {
         stop(); if (songOffsets.empty()) return false;
-        currentIndex = index; browserIndex = index; currentTitle = ""; currentArtist = "";
+        currentIndex = index; browserIndex = index; currentTitle = ""; currentArtist = "";currentAlbum = "";
         String fname = getSongPath(currentIndex);
 
         file = new AudioFileSourceSD(fname.c_str());
@@ -610,12 +624,197 @@ public:
         if (!audioApp.decoder || !audioApp.decoder->isRunning() || audioApp.isPaused || !showVisualizer) return;
         auto buf = out->getBuffer();
         if (buf) {
-            memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t)); fft.exec(raw_data); visSprite.fillScreen(C_BG_DARK); int visH = visSprite.height();
-            for (size_t bx = 0; bx < min((int)(visSprite.width() / 4), FFT_SIZE / 2); ++bx) {
-                int32_t barH = min((int)((fft.get(bx) * visH) >> 16), visH);
-                uint16_t color = barH < visH * 0.4 ? C_ACCENT : (barH < visH * 0.7 ? C_HIGHLIGHT : TFT_RED);
-                visSprite.fillRect(bx * 4, visH - barH, 3, barH, color);
+            // --- MODE 3: METADATA DASHBOARD (OFF) ---
+            // --- MODE 3: METADATA DASHBOARD & ANIMATIONS ---
+            if (userSettings.visMode == 3) {
+                visSprite.fillScreen(C_BG_DARK);
+                
+                // Draw a stylized "Cover Art" Placeholder Box Frame
+                visSprite.fillRoundRect(2, 2, 38, 38, 4, C_BG_LIGHT);
+                visSprite.drawRoundRect(2, 2, 38, 38, 4, C_ACCENT);
+                
+                int cx = 21; // Center X of the cover box
+                int cy = 21; // Center Y
+                
+                // Pick animation based on the song index (cycles 0, 1, 2, 3)
+                int animType = audioApp.currentIndex % 4;
+
+                switch (animType) {
+                    case 0: {
+                        // --- 1. VINYL RECORD ---
+                        int r = 16;
+                        float angle = millis() / 400.0; 
+                        visSprite.fillCircle(cx, cy, r, C_BG_DARK); 
+                        visSprite.drawCircle(cx, cy, r, C_TEXT_DIM);
+                        visSprite.drawCircle(cx, cy, r - 4, 0x0000); // Black grooves
+                        visSprite.drawCircle(cx, cy, r - 8, 0x0000);
+                        visSprite.fillCircle(cx, cy, 6, C_ACCENT); // Label
+                        visSprite.fillCircle(cx + (cos(angle) * 3), cy + (sin(angle) * 3), 2, C_BG_DARK); // Spinning dot
+                        visSprite.fillCircle(cx, cy, 2, C_BG_DARK); // Hole
+                        // Tonearm
+                        visSprite.drawLine(35, 5, 26, 15, C_TEXT_MAIN); 
+                        visSprite.fillCircle(35, 5, 3, C_TEXT_DIM);     
+                        visSprite.fillRect(24, 14, 4, 6, C_HIGHLIGHT);  
+                        break;
+                    }
+                    case 1: {
+                        // --- 2. CASSETTE TAPE ---
+                        float angle = millis() / 200.0; // Reels spin faster
+                        visSprite.fillRoundRect(cx - 14, cy - 9, 28, 18, 2, C_TEXT_DIM); // Cassette shell
+                        visSprite.fillRoundRect(cx - 8, cy - 3, 16, 6, 1, C_BG_DARK); // Window
+                        // Left Reel
+                        int lx = cx - 5, ly = cy;
+                        visSprite.drawCircle(lx, ly, 3, C_TEXT_MAIN);
+                        visSprite.drawLine(lx - cos(angle)*3, ly - sin(angle)*3, lx + cos(angle)*3, ly + sin(angle)*3, C_TEXT_MAIN);
+                        // Right Reel
+                        int rx = cx + 5, ry = cy;
+                        visSprite.drawCircle(rx, ry, 3, C_TEXT_MAIN);
+                        visSprite.drawLine(rx - cos(angle)*3, ry - sin(angle)*3, rx + cos(angle)*3, ry + sin(angle)*3, C_TEXT_MAIN);
+                        // Bottom bridge
+                        visSprite.drawLine(cx - 6, cy + 7, cx + 6, cy + 7, C_BG_DARK);
+                        visSprite.drawLine(cx - 4, cy + 8, cx + 4, cy + 8, C_BG_DARK);
+                        break;
+                    }
+                    case 2: {
+                        // --- 3. THUMPING SPEAKER ---
+                        // Use sine wave to make the radius pulse continuously
+                        float pulse = sin(millis() / 150.0); 
+                        int r = 10 + (pulse * 2); 
+                        visSprite.fillRect(cx - 12, cy - 15, 24, 30, C_TEXT_DIM); // Speaker cabinet
+                        visSprite.drawRect(cx - 12, cy - 15, 24, 30, C_TEXT_MAIN);
+                        // Tweeter
+                        visSprite.fillCircle(cx, cy - 8, 4, C_BG_DARK);
+                        visSprite.drawCircle(cx, cy - 8, 2, C_BG_LIGHT);
+                        // Main Woofer (Pulses)
+                        visSprite.fillCircle(cx, cy + 4, 12, C_BG_DARK);
+                        visSprite.fillCircle(cx, cy + 4, r, C_TEXT_DIM);
+                        visSprite.fillCircle(cx, cy + 4, r - 3, C_BG_DARK);
+                        visSprite.fillCircle(cx, cy + 4, 3, C_ACCENT); // Dust cap
+                        break;
+                    }
+                    case 3: {
+                        // --- 4. SPINNING CD ---
+                        int r = 16;
+                        float angle = millis() / 300.0;
+                        visSprite.fillCircle(cx, cy, r, C_TEXT_MAIN); // Silver disc
+                        visSprite.drawCircle(cx, cy, r, C_TEXT_DIM);
+                        
+                        // Sweeping Reflection 1
+                        float a2 = angle + PI/4; 
+                        visSprite.fillTriangle(cx, cy, cx + cos(angle)*r, cy + sin(angle)*r, cx + cos(a2)*r, cy + sin(a2)*r, C_HIGHLIGHT);
+                        
+                        // Sweeping Reflection 2 (opposite side)
+                        float a3 = angle + PI;
+                        float a4 = angle + PI + PI/4;
+                        visSprite.fillTriangle(cx, cy, cx + cos(a3)*r, cy + sin(a3)*r, cx + cos(a4)*r, cy + sin(a4)*r, C_ACCENT);
+                        
+                        // Center Rings & Hole
+                        visSprite.fillCircle(cx, cy, 6, C_BG_DARK);
+                        visSprite.drawCircle(cx, cy, 6, C_TEXT_DIM);
+                        visSprite.fillCircle(cx, cy, 2, C_BG_LIGHT); // Transparent hole
+                        break;
+                    }
+                }
+
+                // 2. Format the Text (Artist, Album, Time)
+                String artist = audioApp.currentArtist.length() > 0 ? audioApp.currentArtist : "Unknown Artist";
+                String album = audioApp.currentAlbum.length() > 0 ? audioApp.currentAlbum : "Unknown Album";
+                
+                visSprite.setFont(&fonts::Font0);
+                
+                // Artist Name
+                visSprite.setTextColor(C_TEXT_MAIN);
+                visSprite.setCursor(45, 4);
+                visSprite.print(artist.substring(0, 12)); 
+                
+                // Album Name
+                visSprite.setTextColor(C_TEXT_DIM);
+                visSprite.setCursor(45, 16);
+                visSprite.print(album.substring(0, 12));
+                
+                // 3. Calculate Playback Time 
+                int elapsedSec = 0, totalSec = 0;
+                if (audioApp.id3 && audioApp.id3->getSize() > 0) {
+                    elapsedSec = audioApp.id3->getPos() / 16000;
+                    totalSec = audioApp.id3->getSize() / 16000;
+                }
+                
+                char timeStr[16];
+                sprintf(timeStr, "%02d:%02d/%02d:%02d", elapsedSec / 60, elapsedSec % 60, totalSec / 60, totalSec % 60);
+                
+                visSprite.setTextColor(C_HIGHLIGHT);
+                visSprite.setCursor(45, 28);
+                visSprite.print(timeStr);
+
+                // Push to screen
+                visSprite.pushSprite(PLAYLIST_WIDTH + 2, HEADER_HEIGHT + 55);
+                return;
             }
+            memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t)); 
+            fft.exec(raw_data); 
+            visSprite.fillScreen(C_BG_DARK); 
+            int visW = visSprite.width();
+            int visH = visSprite.height();
+
+            if (userSettings.visMode == 0) {
+                // --- MODE 0: CLASSIC BARS ---
+                for (size_t bx = 0; bx < min((int)(visW / 4), FFT_SIZE / 2); ++bx) {
+                    int32_t barH = min((int)((fft.get(bx) * visH) >> 16), visH);
+                    uint16_t color = barH < visH * 0.4 ? C_ACCENT : (barH < visH * 0.7 ? C_HIGHLIGHT : TFT_RED);
+                    visSprite.fillRect(bx * 4, visH - barH, 3, barH, color);
+                }
+            } 
+            else if (userSettings.visMode == 1) {
+                // --- MODE 1: WAVEFORM LINE ---
+                int prevX = 0, prevY = visH;
+                int numPoints = min((int)visW, FFT_SIZE / 2);
+                float step = (float)visW / numPoints;
+                
+                for (size_t bx = 0; bx < numPoints; ++bx) {
+                    int32_t val = min((int)((fft.get(bx) * visH) >> 16), visH);
+                    int x = (int)(bx * step);
+                    int y = visH - val;
+                    if (bx > 0) visSprite.drawLine(prevX, prevY, x, y, C_ACCENT);
+                    
+                    // Optional: Add a light fill under the line
+                    visSprite.drawLine(x, y, x, visH, C_BG_LIGHT); 
+                    prevX = x; prevY = y;
+                }
+            }
+            else if (userSettings.visMode == 2) {
+                // --- MODE 2: CIRCULAR SPIKES ---
+                int cx = visW / 2;
+                int cy = visH / 2;
+                int baseR = 12; // Radius of the inner circle
+                int numBins = 32; // Limit bins so the circle isn't too crowded
+                float angleStep = 2.0 * PI / numBins;
+
+                // Draw the reacting spikes
+                for (int i = 0; i < numBins; i++) {
+                    // Grab lower frequencies to make it punchy, scale it down slightly
+                    int32_t val = min((int)((fft.get(i) * (visH / 2)) >> 16), visH / 2);
+                    float angle = i * angleStep;
+                    
+                    int x1 = cx + cos(angle) * baseR;
+                    int y1 = cy + sin(angle) * baseR;
+                    int x2 = cx + cos(angle) * (baseR + val);
+                    int y2 = cy + sin(angle) * (baseR + val);
+
+                    uint16_t color = val < (visH / 4) ? C_ACCENT : C_HIGHLIGHT;
+                    visSprite.drawLine(x1, y1, x2, y2, color);
+                    
+                    // Draw a mirrored spike for symmetry on the other side of the circle
+                    float mirrorAngle = angle + PI;
+                    int mx1 = cx + cos(mirrorAngle) * baseR;
+                    int my1 = cy + sin(mirrorAngle) * baseR;
+                    int mx2 = cx + cos(mirrorAngle) * (baseR + val);
+                    int my2 = cy + sin(mirrorAngle) * (baseR + val);
+                    visSprite.drawLine(mx1, my1, mx2, my2, color);
+                }
+                // Draw the solid inner ring
+                visSprite.drawCircle(cx, cy, baseR, C_PLAYING);
+            }
+
             visSprite.pushSprite(PLAYLIST_WIDTH + 2, HEADER_HEIGHT + 55);
         }
     }
@@ -638,11 +837,12 @@ public:
                 case 5: M5Cardputer.Display.printf("Wi-Fi Mode: %s", userSettings.isAPMode ? "AP (Host)" : "STA (Client)"); break; 
                 case 6: M5Cardputer.Display.printf("Power Saver: %s", powerModeLabels[userSettings.powerSaverMode]); break;
                 case 7: M5Cardputer.Display.printf("Theme: %s", themeLabels[userSettings.themeIndex]); break;
-                case 8: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; 
-                case 9: M5Cardputer.Display.print("> Setup AP (Host)"); break;
-                case 10: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    
-                case 11: M5Cardputer.Display.print("[ EXPORT CONFIG TO SD ]"); break; 
-                case 12: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;      
+                case 8: M5Cardputer.Display.printf("Visualizer: %s", visModeLabels[userSettings.visMode]); break;
+                case 9: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; 
+                case 10: M5Cardputer.Display.print("> Setup AP (Host)"); break;
+                case 11: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    
+                case 12: M5Cardputer.Display.print("[ EXPORT CONFIG TO SD ]"); break; 
+                case 13: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;      
             }
         }
     }
@@ -691,6 +891,7 @@ void AudioEngine::MDCallback(void *cbData, const char *type, bool isUnicode, con
     if (string[0] == 0) return;
     if (strcmp(type, "Title") == 0) { audioApp.currentTitle = String(string); if (currentState == UI_PLAYER) UIManager::drawNowPlaying(); } 
     else if (strcmp(type, "Artist") == 0) { audioApp.currentArtist = String(string); }
+    else if (strcmp(type, "Album") == 0) { audioApp.currentAlbum = String(string); }
 }
 
 // ==========================================
@@ -904,7 +1105,10 @@ void loop() {
                 else if (M5Cardputer.Keyboard.isKeyPressed('b')) { audioApp.prev(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed('s')) { audioApp.isShuffle = !audioApp.isShuffle; UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed('l')) { audioApp.loopMode = (LoopState)((audioApp.loopMode + 1) % 3); UIManager::drawNowPlaying(); }
-                else if (M5Cardputer.Keyboard.isKeyPressed('v')) { UIManager::showVisualizer = !UIManager::showVisualizer; UIManager::drawBaseUI(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('v')) { 
+                    userSettings.visMode = (userSettings.visMode + 1) % NUM_VIS_MODES;
+                    UIManager::drawBaseUI(); 
+                }
                 else if (M5Cardputer.Keyboard.isKeyPressed('/')) { audioApp.seek(5); UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed(',')) { audioApp.seek(-5); UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed(']')) { M5Cardputer.Speaker.setVolume(min(255, M5Cardputer.Speaker.getVolume() + 10)); UIManager::drawNowPlaying(); }
@@ -914,13 +1118,13 @@ void loop() {
             case UI_SETTINGS:
                 if (M5Cardputer.Keyboard.isKeyPressed('`')) { ConfigManager::save(); currentState = UI_PLAYER; UIManager::drawBaseUI(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
-                    UIManager::settingsCursor = (UIManager::settingsCursor - 1 + 12) % 12;
+                    UIManager::settingsCursor = (UIManager::settingsCursor - 1 + numSettings) % numSettings;
                     if (UIManager::settingsCursor < UIManager::menuScrollOffset) UIManager::menuScrollOffset = UIManager::settingsCursor;
                     else if (UIManager::settingsCursor == 11) UIManager::menuScrollOffset = 8;
                     UIManager::drawSettings(); 
                 }
                 else if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
-                    UIManager::settingsCursor = (UIManager::settingsCursor + 1) % 12; 
+                    UIManager::settingsCursor = (UIManager::settingsCursor + 1) % numSettings; 
                     if (UIManager::settingsCursor >= UIManager::menuScrollOffset + 4) UIManager::menuScrollOffset++;
                     else if (UIManager::settingsCursor == 0) UIManager::menuScrollOffset = 0;
                     UIManager::drawSettings(); 
@@ -941,21 +1145,25 @@ void loop() {
                             applyTheme(userSettings.themeIndex);
                             UIManager::drawBaseUI(); // Redraw background instantly to show off new colors
                             break;
+                        case 8: // --- VISUALIZER TOGGLE ---
+                            userSettings.visMode = (userSettings.visMode + (right?1:-1) + NUM_VIS_MODES) % NUM_VIS_MODES;
+                            UIManager::drawBaseUI(); 
+                            break;
                     }
                     UIManager::drawSettings();
                 }
                 else if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
                     switch(UIManager::settingsCursor) {
-                        case 8: // Wi-Fi Setup
+                        case 9: // Wi-Fi Setup
                             currentState = UI_WIFI_SCAN; WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(100);
                             UIManager::wifiNetworkCount = WiFi.scanNetworks(); UIManager::wifiCursor = 0; UIManager::wifiScrollOffset = 0;
                             UIManager::drawWifiScanner(); break;
-                        case 9: // AP Setup
+                        case 10: // AP Setup
                             currentState = UI_TEXT_INPUT; textInputTarget = 1; enteredText = userSettings.apSSID;
                             UIManager::drawTextInput(); break;
-                        case 10: audioApp.performFullScan(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
-                        case 11: ConfigManager::exportToSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
-                        case 12: ConfigManager::importFromSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 11: audioApp.performFullScan(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 12: ConfigManager::exportToSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 13: ConfigManager::importFromSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
                     }
                 }
                 break;
