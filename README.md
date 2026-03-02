@@ -2,7 +2,7 @@
 
 A fully featured, standalone MP3 player designed specifically for the **M5Stack Cardputer**. This application turns your Cardputer into a pocket-sized music station with a graphical interface, audio visualizer, playlist management, and keyboard controls.
 
-
+Tutorial : https://youtu.be/wLGi9sBn_3s
 
 ## ✨ Features
 
