@@ -94,11 +94,11 @@ const char* helpLines[] = {
   "; / . : Scroll / Navigate",
   "[ / ] : Volume - / +",
   "N / B : Next / Prev Song",
-  "/ / , : Seek +5s / -5s",
-  "S: Shuffle   L: Loop Mode", 
+  "/ / , : Seek +Xs / -Xs",
+  "S: Shuffle   L: Loop Mode",
   "Esc / ` : Settings",
   "V: Visualizer",
-  "I: Close Help",
+  "I:print Close Help",
   "--- SMART FEATURES ---",
   "Web UI: Enable Wi-Fi in",
   "settings to access.",
@@ -140,6 +140,7 @@ struct Settings {
     String apSSID = "Cardputer";   
     String apPass = "12345678";    
     int powerSaverMode = 0;        
+    int seek = 0;
 };
 
 Settings userSettings;
@@ -241,6 +242,7 @@ public:
         userSettings.powerSaverMode = preferences.getInt("powerMode", 0);
         userSettings.themeIndex = preferences.getInt("themeIndex", 0);
         userSettings.visMode = preferences.getInt("visMode", 0);
+        userSettings.seek = preferences.getInt("seek", 5);
         preferences.end();
         
         if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
@@ -265,6 +267,7 @@ public:
         preferences.putInt("powerMode", userSettings.powerSaverMode);
         preferences.putInt("themeIndex", userSettings.themeIndex);
         preferences.putInt("visMode", userSettings.visMode);
+        preferences.putInt("seek", userSettings.seek);
         preferences.end();
     }
 
@@ -278,7 +281,7 @@ public:
             file.println(userSettings.wifiEnabled ? 1 : 0); file.println(userSettings.wifiSSID);
             file.println(userSettings.wifiPass); file.println(userSettings.isAPMode ? 1 : 0);
             file.println(userSettings.apSSID); file.println(userSettings.apPass);
-            file.println(userSettings.powerSaverMode); file.close();
+            file.println(userSettings.powerSaverMode); file.println(userSettings.seek); file.close();
             
             M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
             M5Cardputer.Display.setTextColor(C_PLAYING); M5Cardputer.Display.print("Exported to SD!"); delay(1000);
@@ -305,6 +308,7 @@ public:
             if(file.available()) { userSettings.apSSID = file.readStringUntil('\n'); userSettings.apSSID.trim(); }
             if(file.available()) { userSettings.apPass = file.readStringUntil('\n'); userSettings.apPass.trim(); }
             if(file.available()) userSettings.powerSaverMode = file.readStringUntil('\n').toInt();
+            if(file.available()) userSettings.seek = file.readStringUntil('\n').toInt();
             file.close();
             save(); M5Cardputer.Display.setBrightness(userSettings.brightness);
             M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
@@ -822,7 +826,7 @@ public:
     static void drawSettings() {
         drawPopup("SETTINGS", "Press 'Esc' to Exit");
         int startY = 45, gap = 20;
-        int items = 13;
+        int items = 14;
         for (int i = 0; i < 4; i++) {
             int idx = menuScrollOffset + i; if (idx >= items) break;
             M5Cardputer.Display.setCursor(25, startY + (i * gap));
@@ -833,16 +837,17 @@ public:
                 case 1: M5Cardputer.Display.printf("Screen Off: %s", timeoutLabels[userSettings.timeoutIndex]); break;
                 case 2: M5Cardputer.Display.printf("Resume Play: %s", userSettings.resumePlay ? "ON" : "OFF"); break;
                 case 3: M5Cardputer.Display.printf("DAC Rate: %s", sampleRateLabels[userSettings.spkRateIndex]); break;
-                case 4: M5Cardputer.Display.printf("Wi-Fi Power: %s", userSettings.wifiEnabled ? "ON" : "OFF"); break;
-                case 5: M5Cardputer.Display.printf("Wi-Fi Mode: %s", userSettings.isAPMode ? "AP (Host)" : "STA (Client)"); break; 
-                case 6: M5Cardputer.Display.printf("Power Saver: %s", powerModeLabels[userSettings.powerSaverMode]); break;
-                case 7: M5Cardputer.Display.printf("Theme: %s", themeLabels[userSettings.themeIndex]); break;
-                case 8: M5Cardputer.Display.printf("Visualizer: %s", visModeLabels[userSettings.visMode]); break;
-                case 9: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; 
-                case 10: M5Cardputer.Display.print("> Setup AP (Host)"); break;
-                case 11: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    
-                case 12: M5Cardputer.Display.print("[ EXPORT CONFIG TO SD ]"); break; 
-                case 13: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;      
+                case 4: M5Cardputer.Display.printf("Seek Value: %d", userSettings.seek); break;
+                case 5: M5Cardputer.Display.printf("Wi-Fi Power: %s", userSettings.wifiEnabled ? "ON" : "OFF"); break;
+                case 6: M5Cardputer.Display.printf("Wi-Fi Mode: %s", userSettings.isAPMode ? "AP (Host)" : "STA (Client)"); break; 
+                case 7: M5Cardputer.Display.printf("Power Saver: %s", powerModeLabels[userSettings.powerSaverMode]); break;
+                case 8: M5Cardputer.Display.printf("Theme: %s", themeLabels[userSettings.themeIndex]); break;
+                case 9: M5Cardputer.Display.printf("Visualizer: %s", visModeLabels[userSettings.visMode]); break;
+                case 10: M5Cardputer.Display.print("> Setup Wi-Fi Network"); break; 
+                case 11: M5Cardputer.Display.print("> Setup AP (Host)"); break;
+                case 12: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    
+                case 13: M5Cardputer.Display.print("[ EXPORT CONFIG TO SD ]"); break; 
+                case 14: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;      
             }
         }
     }
@@ -1109,8 +1114,8 @@ void loop() {
                     userSettings.visMode = (userSettings.visMode + 1) % NUM_VIS_MODES;
                     UIManager::drawBaseUI(); 
                 }
-                else if (M5Cardputer.Keyboard.isKeyPressed('/')) { audioApp.seek(5); UIManager::drawNowPlaying(); }
-                else if (M5Cardputer.Keyboard.isKeyPressed(',')) { audioApp.seek(-5); UIManager::drawNowPlaying(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('/')) { audioApp.seek(userSettings.seek); UIManager::drawNowPlaying(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed(',')) { audioApp.seek(-userSettings.seek); UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed(']')) { M5Cardputer.Speaker.setVolume(min(255, M5Cardputer.Speaker.getVolume() + 10)); UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed('[')) { M5Cardputer.Speaker.setVolume(max(0, M5Cardputer.Speaker.getVolume() - 10)); UIManager::drawNowPlaying(); }
                 break;
@@ -1137,15 +1142,16 @@ void loop() {
                         case 2: userSettings.resumePlay = !userSettings.resumePlay; break;
                         case 3: userSettings.spkRateIndex = (userSettings.spkRateIndex + (right?1:-1) + 5) % 5; 
                                 { auto c = M5Cardputer.Speaker.config(); c.sample_rate = sampleRateValues[userSettings.spkRateIndex]; M5Cardputer.Speaker.config(c); } break;
-                        case 4: userSettings.wifiEnabled = !userSettings.wifiEnabled; break;
-                        case 5: userSettings.isAPMode = !userSettings.isAPMode; break;
-                        case 6: userSettings.powerSaverMode = (userSettings.powerSaverMode + (right?1:-1) + 3) % 3; applyCpuFrequency(); break;
-                        case 7: // --- THEME SWITCHER ---
+                        case 4: userSettings.seek = constrain(userSettings.seek + (right?5:-5), 5, 60); break;
+                        case 5: userSettings.wifiEnabled = !userSettings.wifiEnabled; break;
+                        case 6: userSettings.isAPMode = !userSettings.isAPMode; break;
+                        case 7: userSettings.powerSaverMode = (userSettings.powerSaverMode + (right?1:-1) + 3) % 3; applyCpuFrequency(); break;
+                        case 8: // --- THEME SWITCHER ---
                             userSettings.themeIndex = (userSettings.themeIndex + (right?1:-1) + NUM_THEMES) % NUM_THEMES;
                             applyTheme(userSettings.themeIndex);
                             UIManager::drawBaseUI(); // Redraw background instantly to show off new colors
                             break;
-                        case 8: // --- VISUALIZER TOGGLE ---
+                        case 9: // --- VISUALIZER TOGGLE ---
                             userSettings.visMode = (userSettings.visMode + (right?1:-1) + NUM_VIS_MODES) % NUM_VIS_MODES;
                             UIManager::drawBaseUI(); 
                             break;
@@ -1154,16 +1160,16 @@ void loop() {
                 }
                 else if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
                     switch(UIManager::settingsCursor) {
-                        case 9: // Wi-Fi Setup
+                        case 10: // Wi-Fi Setup
                             currentState = UI_WIFI_SCAN; WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(100);
                             UIManager::wifiNetworkCount = WiFi.scanNetworks(); UIManager::wifiCursor = 0; UIManager::wifiScrollOffset = 0;
                             UIManager::drawWifiScanner(); break;
-                        case 10: // AP Setup
+                        case 11: // AP Setup
                             currentState = UI_TEXT_INPUT; textInputTarget = 1; enteredText = userSettings.apSSID;
                             UIManager::drawTextInput(); break;
-                        case 11: audioApp.performFullScan(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
-                        case 12: ConfigManager::exportToSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
-                        case 13: ConfigManager::importFromSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 12: audioApp.performFullScan(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 13: ConfigManager::exportToSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 14: ConfigManager::importFromSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
                     }
                 }
                 break;
