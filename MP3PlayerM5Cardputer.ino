@@ -119,7 +119,7 @@ const char* helpLines[] = {
   "Share your suggestions!"
 };
 const int numHelpLines = 28;
-const int numSettings = 14;
+const int numSettings = 15;
 
 // ==========================================
 // GLOBALS
@@ -348,6 +348,11 @@ public:
         File root = fs.open(dirname); if (!root || !root.isDirectory()) return;
         File file = root.openNextFile();
         while (file) {
+            String fname = file.name();
+            if (fname.startsWith(".")){
+                file = root.openNextFile();
+                continue;
+            }
             if (file.isDirectory()) { if (levels) listDir(fs, file.path(), levels - 1, playlistFile); } 
             else {
                 String filename = file.name(); String filepath = file.path();
@@ -826,7 +831,7 @@ public:
     static void drawSettings() {
         drawPopup("SETTINGS", "Press 'Esc' to Exit");
         int startY = 45, gap = 20;
-        int items = 14;
+        int items = numSettings;
         for (int i = 0; i < 4; i++) {
             int idx = menuScrollOffset + i; if (idx >= items) break;
             M5Cardputer.Display.setCursor(25, startY + (i * gap));
