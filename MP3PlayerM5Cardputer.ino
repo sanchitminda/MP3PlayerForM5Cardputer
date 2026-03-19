@@ -10,6 +10,8 @@
 #include <nvs_flash.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "USB.h"
+#include "USBMSC.h"
 
 // Audio Libraries
 #include <AudioOutput.h>
@@ -20,7 +22,6 @@
 #include <AudioGeneratorAAC.h>
 #include <AudioGeneratorWAV.h>
 #include <AudioFileSourceBuffer.h>
-
 // ==========================================
 // CONSTANTS & CONFIG
 // ==========================================
@@ -28,24 +29,14 @@
 #define SD_SPI_MISO_PIN 39
 #define SD_SPI_MOSI_PIN 14
 #define SD_SPI_CS_PIN   12
-#define PLAYLIST_FILE "/playlist.txt"
-#define CONFIG_FILE "/config.txt"
+#define PLAYLIST_FILE   "/playlist.txt"   // "All Music" flat cache
+#define CONFIG_FILE     "/config.txt"
 
 #define PLAYLIST_WIDTH 120
 #define ROW_HEIGHT 15
 #define HEADER_HEIGHT 20
 #define BOTTOM_BAR_HEIGHT 18
 #define MAX_VISIBLE_ROWS 6  
-
-// Colors
-// #define C_BG_DARK     0x1002
-// #define C_BG_LIGHT    0x2124
-// #define C_HEADER      0x18E3
-// #define C_ACCENT      0x05BF
-// #define C_PLAYING     0x07E0
-// #define C_HIGHLIGHT   0xF81F
-// #define C_TEXT_MAIN   0xFFFF
-// #define C_TEXT_DIM    0x9492
 
 // --- DYNAMIC COLORS & THEMES ---
 uint16_t C_BG_DARK, C_BG_LIGHT, C_HEADER, C_ACCENT, C_PLAYING, C_HIGHLIGHT, C_TEXT_MAIN, C_TEXT_DIM;
@@ -63,8 +54,8 @@ void applyTheme(int index) {
             C_TEXT_MAIN = 0xFFFF; C_TEXT_DIM = 0x9492;
             break;
         case 1: // Cyberpunk
-            C_BG_DARK = 0x0803; C_BG_LIGHT = 0x1866; C_HEADER = 0xA013; // Deep purples
-            C_ACCENT = 0x07FF; C_PLAYING = 0xFFE0; C_HIGHLIGHT = 0xF800; // Cyan, Yellow, Pink
+            C_BG_DARK = 0x0803; C_BG_LIGHT = 0x1866; C_HEADER = 0xA013;
+            C_ACCENT = 0x07FF; C_PLAYING = 0xFFE0; C_HIGHLIGHT = 0xF800;
             C_TEXT_MAIN = 0xFFFF; C_TEXT_DIM = 0x7BEF;
             break;
         case 2: // Retro Amber
@@ -81,7 +72,7 @@ void applyTheme(int index) {
 }
 
 enum LoopState { NO_LOOP, LOOP_ALL, LOOP_ONE };
-enum UIState { UI_PLAYER, UI_SETTINGS, UI_HELP, UI_WIFI_SCAN, UI_TEXT_INPUT };
+enum UIState { UI_PLAYER, UI_SETTINGS, UI_HELP, UI_WIFI_SCAN, UI_TEXT_INPUT, UI_FOLDER_SELECT, UI_SEARCH };
 
 const uint32_t sampleRateValues[] = { 44100, 48000, 88200, 96000, 128000 };
 const char* sampleRateLabels[] = { "44.1k", "48k", "88.2k", "96k", "128k" };
@@ -95,7 +86,7 @@ const char* helpLines[] = {
   "[ / ] : Volume - / +",
   "N / B : Next / Prev Song",
   "/ / , : Seek +Xs / -Xs",
-  "S: Shuffle   L: Loop Mode",
+  "S: Search    F: Shuffle",
   "Esc / ` : Settings",
   "V: Visualizer",
   "I:print Close Help",
@@ -119,7 +110,7 @@ const char* helpLines[] = {
   "Share your suggestions!"
 };
 const int numHelpLines = 28;
-const int numSettings = 15;
+const int numSettings = 16;   // +1 for Playlist Mode
 
 // ==========================================
 // GLOBALS
@@ -127,7 +118,7 @@ const int numSettings = 15;
 struct Settings {
     int brightness = 100;      
     int themeIndex = 0;
-    int visMode = 0; // NEW: 0=Bars, 1=Line, 2=Circle
+    int visMode = 0;
     int timeoutIndex = 0;      
     bool resumePlay = true;    
     int spkRateIndex = 4;      
@@ -141,6 +132,7 @@ struct Settings {
     String apPass = "12345678";    
     int powerSaverMode = 0;        
     int seek = 0;
+    String currentFolder = "";    // "" = All Music; "/FolderName" = specific folder
 };
 
 Settings userSettings;
@@ -155,6 +147,15 @@ bool isScreenOff = false;
 // Text Input Globals
 int textInputTarget = 0; // 0=STA Pass, 1=AP SSID, 2=AP Pass
 String enteredText = "";
+
+// Active playlist path (changes when user picks a folder)
+String g_activePlaylist = PLAYLIST_FILE;
+
+// Search globals
+String g_searchQuery = "";
+std::vector<int> g_searchResults;  // indices into audioApp.songOffsets
+int g_searchCursor = 0;
+int g_searchScrollOffset = 0;
 
 // ==========================================
 // HARDWARE CLASSES (FFT & SPEAKER)
@@ -193,7 +194,6 @@ public:
   }
   uint32_t get(size_t index) { return (index < FFT_SIZE / 2) ? (uint32_t)sqrtf(_fr[ index ] * _fr[ index ] + _fi[ index ] * _fi[ index ]) : 0u; }
 };
-
 class AudioOutputM5Speaker : public AudioOutput {
   public:
     AudioOutputM5Speaker(m5::Speaker_Class* m5sound, uint8_t virtual_sound_channel = 0) { _m5sound = m5sound; _virtual_ch = virtual_sound_channel; }
@@ -215,10 +215,10 @@ class AudioOutputM5Speaker : public AudioOutput {
     int16_t _tri_buffer[3][tri_buf_size]; size_t _tri_buffer_index = 0; size_t _tri_index = 0;
 };
 
+AudioOutputM5Speaker *out = nullptr;
 static constexpr size_t WAVE_SIZE = 320;
 static fft_t fft;
 static int16_t raw_data[WAVE_SIZE * 2];
-static AudioOutputM5Speaker *out = nullptr;
 
 // ==========================================
 // CONFIG MANAGER
@@ -243,6 +243,7 @@ public:
         userSettings.themeIndex = preferences.getInt("themeIndex", 0);
         userSettings.visMode = preferences.getInt("visMode", 0);
         userSettings.seek = preferences.getInt("seek", 5);
+        userSettings.currentFolder = preferences.getString("curFolder", "");
         preferences.end();
         
         if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
@@ -268,6 +269,7 @@ public:
         preferences.putInt("themeIndex", userSettings.themeIndex);
         preferences.putInt("visMode", userSettings.visMode);
         preferences.putInt("seek", userSettings.seek);
+        preferences.putString("curFolder", userSettings.currentFolder);
         preferences.end();
     }
 
@@ -281,7 +283,8 @@ public:
             file.println(userSettings.wifiEnabled ? 1 : 0); file.println(userSettings.wifiSSID);
             file.println(userSettings.wifiPass); file.println(userSettings.isAPMode ? 1 : 0);
             file.println(userSettings.apSSID); file.println(userSettings.apPass);
-            file.println(userSettings.powerSaverMode); file.println(userSettings.seek); file.close();
+            file.println(userSettings.powerSaverMode); file.println(userSettings.seek);
+            file.println(userSettings.currentFolder); file.close();
             
             M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
             M5Cardputer.Display.setTextColor(C_PLAYING); M5Cardputer.Display.print("Exported to SD!"); delay(1000);
@@ -309,6 +312,7 @@ public:
             if(file.available()) { userSettings.apPass = file.readStringUntil('\n'); userSettings.apPass.trim(); }
             if(file.available()) userSettings.powerSaverMode = file.readStringUntil('\n').toInt();
             if(file.available()) userSettings.seek = file.readStringUntil('\n').toInt();
+            if(file.available()) { userSettings.currentFolder = file.readStringUntil('\n'); userSettings.currentFolder.trim(); }
             file.close();
             save(); M5Cardputer.Display.setBrightness(userSettings.brightness);
             M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
@@ -321,6 +325,21 @@ void applyCpuFrequency() {
     if (userSettings.wifiEnabled || userSettings.powerSaverMode == 0) setCpuFrequencyMhz(240); 
     else if (userSettings.powerSaverMode == 1) setCpuFrequencyMhz(160); 
     else setCpuFrequencyMhz(80); 
+}
+
+// ==========================================
+// PLAYLIST HELPERS
+// ==========================================
+// Returns the cache file path for a given folder.
+// "" or "/" => the flat "All Music" cache at PLAYLIST_FILE
+// "/Rock"   => "/pl_Rock.txt"
+// "/A/B"    => "/pl_A_B.txt"
+String getPlaylistPath(const String& folder) {
+    if (folder == "" || folder == "/") return String(PLAYLIST_FILE);
+    String safe = folder;
+    if (safe.startsWith("/")) safe = safe.substring(1);
+    safe.replace("/", "_");
+    return "/pl_" + safe + ".txt";
 }
 
 // ==========================================
@@ -346,16 +365,16 @@ public:
 
     void listDir(fs::FS &fs, const char *dirname, uint8_t levels, File &playlistFile) {
         File root = fs.open(dirname); if (!root || !root.isDirectory()) return;
-        File file = root.openNextFile();
-        while (file) {
-            String fname = file.name();
+        File f = root.openNextFile();
+        while (f) {
+            String fname = f.name();
             if (fname.startsWith(".")){
-                file = root.openNextFile();
+                f = root.openNextFile();
                 continue;
             }
-            if (file.isDirectory()) { if (levels) listDir(fs, file.path(), levels - 1, playlistFile); } 
+            if (f.isDirectory()) { if (levels) listDir(fs, f.path(), levels - 1, playlistFile); } 
             else {
-                String filename = file.name(); String filepath = file.path();
+                String filename = f.name(); String filepath = f.path();
                 String filenameLower = filename; filenameLower.toLowerCase();
                 if (filenameLower.endsWith(".mp3") || filenameLower.endsWith(".flac") || filenameLower.endsWith(".m4a") || filenameLower.endsWith(".aac") || filenameLower.endsWith(".wav")) {
                     playlistFile.println(filepath);
@@ -364,23 +383,63 @@ public:
                     M5Cardputer.Display.println(filename); M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
                 }
             }
-            file = root.openNextFile();
+            f = root.openNextFile();
         }
     }
 
+    // Full scan of the entire SD card → saves to PLAYLIST_FILE ("All Music")
     void performFullScan() {
         stop(); songOffsets.clear();
         M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40); M5Cardputer.Display.println("Scanning SD Card...");
         if (SD.exists(PLAYLIST_FILE)) SD.remove(PLAYLIST_FILE);
         File playlistFile = SD.open(PLAYLIST_FILE, FILE_WRITE);
         if (playlistFile) { listDir(SD, "/", 3, playlistFile); playlistFile.close(); }
+        g_activePlaylist = PLAYLIST_FILE;
+        userSettings.currentFolder = "";
         loadPlaylist();
+    }
+
+    // Scan a specific folder and cache it, then load.
+    // folder == "" means "All Music" → delegates to performFullScan.
+    void performFolderScan(const String& folder) {
+        if (folder == "" || folder == "/") { performFullScan(); return; }
+        stop(); songOffsets.clear();
+        M5Cardputer.Display.fillScreen(C_BG_DARK); M5Cardputer.Display.setCursor(10, 40);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN); M5Cardputer.Display.println("Scanning folder...");
+        M5Cardputer.Display.setTextColor(C_ACCENT); M5Cardputer.Display.println(folder);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+
+        String cachePath = getPlaylistPath(folder);
+        if (SD.exists(cachePath)) SD.remove(cachePath);
+        File playlistFile = SD.open(cachePath, FILE_WRITE);
+        if (playlistFile) {
+            listDir(SD, folder.c_str(), 3, playlistFile);
+            playlistFile.close();
+        }
+        g_activePlaylist = cachePath;
+        userSettings.currentFolder = folder;
+        loadPlaylist();
+    }
+
+    // Load (or auto-scan) the playlist for a given folder.
+    // Returns false if no songs found.
+    bool loadPlaylistForFolder(const String& folder) {
+        String cachePath = getPlaylistPath(folder);
+        g_activePlaylist = cachePath;
+        userSettings.currentFolder = (folder == "/" ? "" : folder);
+
+        if (!SD.exists(cachePath)) {
+            // Cache missing → build it now
+            performFolderScan(folder == "" ? "/" : folder);
+            return (songOffsets.size() > 0);
+        }
+        return loadPlaylist();
     }
 
     bool loadPlaylist() {
         songOffsets.clear();
-        if (!SD.exists(PLAYLIST_FILE)) return false;
-        File f = SD.open(PLAYLIST_FILE);
+        if (!SD.exists(g_activePlaylist)) return false;
+        File f = SD.open(g_activePlaylist);
         if (!f) return false;
         while (f.available()) {
             uint32_t pos = f.position(); 
@@ -391,8 +450,8 @@ public:
     }
 
     String getSongPath(int index) {
-        if (index < 0 || index >= songOffsets.size()) return "";
-        File f = SD.open(PLAYLIST_FILE); f.seek(songOffsets[index]); String path = f.readStringUntil('\n'); f.close();
+        if (index < 0 || (size_t)index >= songOffsets.size()) return "";
+        File f = SD.open(g_activePlaylist); f.seek(songOffsets[index]); String path = f.readStringUntil('\n'); f.close();
         path.trim(); if (path.length() > 0 && !path.startsWith("/")) path = "/" + path;
         return path;
     }
@@ -408,7 +467,7 @@ public:
 
     bool play(int index, uint32_t startPos = 0) {
         stop(); if (songOffsets.empty()) return false;
-        currentIndex = index; browserIndex = index; currentTitle = ""; currentArtist = "";currentAlbum = "";
+        currentIndex = index; browserIndex = index; currentTitle = ""; currentArtist = ""; currentAlbum = "";
         String fname = getSongPath(currentIndex);
 
         file = new AudioFileSourceSD(fname.c_str());
@@ -445,7 +504,7 @@ public:
         if (isShuffle) currentIndex = random(0, songOffsets.size());
         else {
             currentIndex++;
-            if (currentIndex >= songOffsets.size()) { if (loopMode == LOOP_ALL) currentIndex = 0; else { stop(); currentIndex = 0; return; } }
+            if ((size_t)currentIndex >= songOffsets.size()) { if (loopMode == LOOP_ALL) currentIndex = 0; else { stop(); currentIndex = 0; return; } }
         }
         play(currentIndex);
     }
@@ -462,6 +521,27 @@ public:
             if (!decoder->loop()) { decoder->stop(); next(true); if(userSettings.resumePlay) ConfigManager::save(id3 ? id3->getPos() : 0, currentIndex); }
         }
     }
+
+    // Scan root for top-level directories. Returns list including "" (All Music).
+    std::vector<String> listRootFolders() {
+        std::vector<String> folders;
+        folders.push_back("");   // index 0 = "All Music"
+        File root = SD.open("/");
+        if (!root || !root.isDirectory()) return folders;
+        File entry = root.openNextFile();
+        while (entry) {
+            if (entry.isDirectory()) {
+                String dname = entry.name();
+                if (!dname.startsWith(".")) {
+                    String path = entry.path();
+                    folders.push_back(path);
+                }
+            }
+            entry = root.openNextFile();
+        }
+        root.close();
+        return folders;
+    }
 };
 
 AudioEngine audioApp;
@@ -477,14 +557,120 @@ public:
     static int wifiCursor;
     static int wifiScrollOffset;
     static int wifiNetworkCount;
-    static int helpScrollOffset; // Add this with the other static ints
+    static int helpScrollOffset;
+
+    // Folder browser state
+    static std::vector<String> folderList;
+    static int folderCursor;
+    static int folderScrollOffset;
+
+    // -----------------------------------------------
+    // SEARCH UI
+    // -----------------------------------------------
+    static void rebuildSearchResults() {
+        g_searchResults.clear();
+        g_searchCursor = 0;
+        g_searchScrollOffset = 0;
+        if (g_searchQuery.length() == 0) return;
+        String queryLower = g_searchQuery; queryLower.toLowerCase();
+        File f = SD.open(g_activePlaylist);
+        if (!f) return;
+        int idx = 0;
+        while (f.available()) {
+            String line = f.readStringUntil('\n'); line.trim();
+            String lineLower = line; lineLower.toLowerCase();
+            // Extract filename portion for matching
+            int slash = lineLower.lastIndexOf('/');
+            String fname = (slash >= 0) ? lineLower.substring(slash + 1) : lineLower;
+            if (fname.indexOf(queryLower) >= 0) {
+                g_searchResults.push_back(idx);
+            }
+            idx++;
+        }
+        f.close();
+    }
+
+    static void drawSearch() {
+        M5Cardputer.Display.fillScreen(C_BG_DARK);
+        // Header
+        M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
+        M5Cardputer.Display.setCursor(5, 5);
+        M5Cardputer.Display.print("Search Songs");
+
+        // Search input box
+        int boxY = HEADER_HEIGHT + 4;
+        M5Cardputer.Display.fillRect(2, boxY, M5Cardputer.Display.width() - 4, 16, C_BG_LIGHT);
+        M5Cardputer.Display.drawRect(2, boxY, M5Cardputer.Display.width() - 4, 16, C_ACCENT);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+        M5Cardputer.Display.setCursor(6, boxY + 4);
+        String displayQuery = g_searchQuery.length() > 0 ? g_searchQuery : "";
+        M5Cardputer.Display.print(displayQuery + "_");
+
+        // Results
+        int yPos = boxY + 20;
+        int totalResults = g_searchResults.size();
+
+        if (g_searchQuery.length() == 0) {
+            M5Cardputer.Display.setTextColor(C_TEXT_DIM);
+            M5Cardputer.Display.setCursor(6, yPos);
+            M5Cardputer.Display.print("Type to search...");
+        } else if (totalResults == 0) {
+            M5Cardputer.Display.setTextColor(TFT_RED);
+            M5Cardputer.Display.setCursor(6, yPos);
+            M5Cardputer.Display.print("No results.");
+        } else {
+            for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
+                int ri = g_searchScrollOffset + i;
+                if (ri >= totalResults) break;
+                int songIdx = g_searchResults[ri];
+                bool isSelected = (ri == g_searchCursor);
+                bool isPlaying  = (songIdx == audioApp.currentIndex);
+
+                if (isSelected) {
+                    M5Cardputer.Display.fillRect(2, yPos - 1, M5Cardputer.Display.width() - 4, ROW_HEIGHT, C_ACCENT);
+                    M5Cardputer.Display.setTextColor(C_BG_DARK);
+                } else if (isPlaying) {
+                    M5Cardputer.Display.setTextColor(C_PLAYING);
+                } else {
+                    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+                }
+
+                // Get filename from playlist
+                String songPath = audioApp.getSongPath(songIdx);
+                int slash = songPath.lastIndexOf('/');
+                String fname = (slash >= 0) ? songPath.substring(slash + 1) : songPath;
+                if (fname.length() > 28) fname = fname.substring(0, 27) + "~";
+
+                M5Cardputer.Display.setCursor(6, yPos + 2);
+                if (isPlaying && !isSelected) M5Cardputer.Display.print("> ");
+                M5Cardputer.Display.print(fname);
+                yPos += ROW_HEIGHT;
+            }
+
+            // Scroll arrows
+            M5Cardputer.Display.setTextColor(C_ACCENT);
+            if (g_searchScrollOffset > 0)
+                M5Cardputer.Display.drawString("^", M5Cardputer.Display.width() - 10, boxY + 22);
+            if (g_searchScrollOffset + MAX_VISIBLE_ROWS < totalResults)
+                M5Cardputer.Display.drawString("v", M5Cardputer.Display.width() - 10, boxY + 20 + (MAX_VISIBLE_ROWS * ROW_HEIGHT) - 6);
+        }
+
+        // Footer
+        int footerY = M5Cardputer.Display.height() - BOTTOM_BAR_HEIGHT;
+        M5Cardputer.Display.fillRect(0, footerY, M5Cardputer.Display.width(), BOTTOM_BAR_HEIGHT, C_HEADER);
+        M5Cardputer.Display.setTextColor(C_TEXT_DIM, C_HEADER);
+        M5Cardputer.Display.setCursor(5, footerY + 4);
+        M5Cardputer.Display.print("Enter:Play ;/.:Scroll  `:Close");
+    }
 
     static void drawHelp() {
         drawPopup("CONTROLS & HELP", "Press 'I' to Exit");
         int px = 15, py = 15;
         int contentY = py + 25;
         int lineHeight = 12;
-        int visibleLines = 7; // How many lines fit in the box at once
+        int visibleLines = 7;
 
         M5Cardputer.Display.setFont(&fonts::Font0);
         M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
@@ -496,7 +682,6 @@ public:
             M5Cardputer.Display.print(helpLines[idx]);
         }
         
-        // Draw little scroll indicators
         M5Cardputer.Display.setTextColor(C_ACCENT);
         if (helpScrollOffset > 0) M5Cardputer.Display.drawString("^", px + 190, contentY);
         if (helpScrollOffset < numHelpLines - visibleLines) M5Cardputer.Display.drawString("v", px + 190, contentY + (visibleLines * lineHeight) - 10);
@@ -528,22 +713,12 @@ public:
     static void drawBattery() {
         int batLevel = M5Cardputer.Power.getBatteryLevel();
         int w = 24, h = 10, x = M5Cardputer.Display.width() - w - 5, y = 5;
-
-        // Clear the background area for the battery icon
         M5Cardputer.Display.fillRect(x - 30, 0, w + 35, HEADER_HEIGHT, C_HEADER); 
-
-        // Draw Battery Outline
         M5Cardputer.Display.drawRect(x, y, w, h, C_TEXT_MAIN); 
         M5Cardputer.Display.fillRect(x + w, y + 2, 2, 6, C_TEXT_MAIN);
-
-        // Determine Color based purely on Percentage
         uint16_t color = batLevel < 20 ? TFT_RED : (batLevel < 50 ? TFT_YELLOW : C_PLAYING);
-        
-        // Draw Battery Fill
         int fillW = max(0, (int)map(batLevel, 0, 100, 0, w - 2));
         M5Cardputer.Display.fillRect(x + 1, y + 1, fillW, h - 2, color);
-
-        // Draw Percentage Text
         M5Cardputer.Display.setFont(&fonts::Font0); 
         M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
         M5Cardputer.Display.setCursor(batLevel == 100 ? x - 29 : x - 25, y + 1); 
@@ -579,7 +754,7 @@ public:
         M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, PLAYLIST_WIDTH, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_LIGHT);
         M5Cardputer.Display.drawFastVLine(PLAYLIST_WIDTH, HEADER_HEIGHT, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_DARK);
 
-        File f = SD.open(PLAYLIST_FILE); if (f && totalSongs > 0) f.seek(audioApp.songOffsets[startIdx]);
+        File f = SD.open(g_activePlaylist); if (f && totalSongs > 0) f.seek(audioApp.songOffsets[startIdx]);
 
         for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
             int actualIdx = startIdx + i; if (actualIdx >= totalSongs) break;
@@ -620,7 +795,7 @@ public:
         if (audioApp.id3 && audioApp.file) {
             int maxW = M5Cardputer.Display.width() - xStart - 10;
             int curW = (int)((float)audioApp.id3->getPos() / (float)audioApp.id3->getSize() * maxW);
-            M5Cardputer.Display.fillRect(xStart-3, yStart+30-3, maxW+6, 9, C_BG_DARK ); M5Cardputer.Display.fillRect(xStart, yStart+30, maxW, 3, C_BG_LIGHT);
+            M5Cardputer.Display.fillRect(xStart-3, yStart+30-3, maxW+6, 9, C_BG_DARK); M5Cardputer.Display.fillRect(xStart, yStart+30, maxW, 3, C_BG_LIGHT);
             M5Cardputer.Display.fillRect(xStart, yStart+30, min(curW, maxW), 3, C_HIGHLIGHT); M5Cardputer.Display.fillCircle(xStart + min(curW, maxW), yStart+30+1, 3, C_TEXT_MAIN);
         }
 
@@ -632,141 +807,76 @@ public:
     static void drawVisualizer() {
         if (!audioApp.decoder || !audioApp.decoder->isRunning() || audioApp.isPaused || !showVisualizer) return;
         auto buf = out->getBuffer();
+        
         if (buf) {
-            // --- MODE 3: METADATA DASHBOARD (OFF) ---
-            // --- MODE 3: METADATA DASHBOARD & ANIMATIONS ---
             if (userSettings.visMode == 3) {
                 visSprite.fillScreen(C_BG_DARK);
-                
-                // Draw a stylized "Cover Art" Placeholder Box Frame
                 visSprite.fillRoundRect(2, 2, 38, 38, 4, C_BG_LIGHT);
                 visSprite.drawRoundRect(2, 2, 38, 38, 4, C_ACCENT);
-                
-                int cx = 21; // Center X of the cover box
-                int cy = 21; // Center Y
-                
-                // Pick animation based on the song index (cycles 0, 1, 2, 3)
+                int cx = 21, cy = 21;
                 int animType = audioApp.currentIndex % 4;
-
                 switch (animType) {
                     case 0: {
-                        // --- 1. VINYL RECORD ---
-                        int r = 16;
-                        float angle = millis() / 400.0; 
-                        visSprite.fillCircle(cx, cy, r, C_BG_DARK); 
-                        visSprite.drawCircle(cx, cy, r, C_TEXT_DIM);
-                        visSprite.drawCircle(cx, cy, r - 4, 0x0000); // Black grooves
-                        visSprite.drawCircle(cx, cy, r - 8, 0x0000);
-                        visSprite.fillCircle(cx, cy, 6, C_ACCENT); // Label
-                        visSprite.fillCircle(cx + (cos(angle) * 3), cy + (sin(angle) * 3), 2, C_BG_DARK); // Spinning dot
-                        visSprite.fillCircle(cx, cy, 2, C_BG_DARK); // Hole
-                        // Tonearm
-                        visSprite.drawLine(35, 5, 26, 15, C_TEXT_MAIN); 
-                        visSprite.fillCircle(35, 5, 3, C_TEXT_DIM);     
-                        visSprite.fillRect(24, 14, 4, 6, C_HIGHLIGHT);  
+                        int r = 16; float angle = millis() / 400.0; 
+                        visSprite.fillCircle(cx, cy, r, C_BG_DARK); visSprite.drawCircle(cx, cy, r, C_TEXT_DIM);
+                        visSprite.drawCircle(cx, cy, r - 4, 0x0000); visSprite.drawCircle(cx, cy, r - 8, 0x0000);
+                        visSprite.fillCircle(cx, cy, 6, C_ACCENT);
+                        visSprite.fillCircle(cx + (cos(angle) * 3), cy + (sin(angle) * 3), 2, C_BG_DARK);
+                        visSprite.fillCircle(cx, cy, 2, C_BG_DARK);
+                        visSprite.drawLine(35, 5, 26, 15, C_TEXT_MAIN); visSprite.fillCircle(35, 5, 3, C_TEXT_DIM); visSprite.fillRect(24, 14, 4, 6, C_HIGHLIGHT);
                         break;
                     }
                     case 1: {
-                        // --- 2. CASSETTE TAPE ---
-                        float angle = millis() / 200.0; // Reels spin faster
-                        visSprite.fillRoundRect(cx - 14, cy - 9, 28, 18, 2, C_TEXT_DIM); // Cassette shell
-                        visSprite.fillRoundRect(cx - 8, cy - 3, 16, 6, 1, C_BG_DARK); // Window
-                        // Left Reel
-                        int lx = cx - 5, ly = cy;
-                        visSprite.drawCircle(lx, ly, 3, C_TEXT_MAIN);
+                        float angle = millis() / 200.0;
+                        visSprite.fillRoundRect(cx - 14, cy - 9, 28, 18, 2, C_TEXT_DIM); visSprite.fillRoundRect(cx - 8, cy - 3, 16, 6, 1, C_BG_DARK);
+                        int lx = cx - 5, ly = cy; visSprite.drawCircle(lx, ly, 3, C_TEXT_MAIN);
                         visSprite.drawLine(lx - cos(angle)*3, ly - sin(angle)*3, lx + cos(angle)*3, ly + sin(angle)*3, C_TEXT_MAIN);
-                        // Right Reel
-                        int rx = cx + 5, ry = cy;
-                        visSprite.drawCircle(rx, ry, 3, C_TEXT_MAIN);
+                        int rx = cx + 5, ry = cy; visSprite.drawCircle(rx, ry, 3, C_TEXT_MAIN);
                         visSprite.drawLine(rx - cos(angle)*3, ry - sin(angle)*3, rx + cos(angle)*3, ry + sin(angle)*3, C_TEXT_MAIN);
-                        // Bottom bridge
-                        visSprite.drawLine(cx - 6, cy + 7, cx + 6, cy + 7, C_BG_DARK);
-                        visSprite.drawLine(cx - 4, cy + 8, cx + 4, cy + 8, C_BG_DARK);
+                        visSprite.drawLine(cx - 6, cy + 7, cx + 6, cy + 7, C_BG_DARK); visSprite.drawLine(cx - 4, cy + 8, cx + 4, cy + 8, C_BG_DARK);
                         break;
                     }
                     case 2: {
-                        // --- 3. THUMPING SPEAKER ---
-                        // Use sine wave to make the radius pulse continuously
-                        float pulse = sin(millis() / 150.0); 
-                        int r = 10 + (pulse * 2); 
-                        visSprite.fillRect(cx - 12, cy - 15, 24, 30, C_TEXT_DIM); // Speaker cabinet
-                        visSprite.drawRect(cx - 12, cy - 15, 24, 30, C_TEXT_MAIN);
-                        // Tweeter
-                        visSprite.fillCircle(cx, cy - 8, 4, C_BG_DARK);
-                        visSprite.drawCircle(cx, cy - 8, 2, C_BG_LIGHT);
-                        // Main Woofer (Pulses)
-                        visSprite.fillCircle(cx, cy + 4, 12, C_BG_DARK);
-                        visSprite.fillCircle(cx, cy + 4, r, C_TEXT_DIM);
-                        visSprite.fillCircle(cx, cy + 4, r - 3, C_BG_DARK);
-                        visSprite.fillCircle(cx, cy + 4, 3, C_ACCENT); // Dust cap
+                        float pulse = sin(millis() / 150.0); int r = 10 + (pulse * 2);
+                        visSprite.fillRect(cx - 12, cy - 15, 24, 30, C_TEXT_DIM); visSprite.drawRect(cx - 12, cy - 15, 24, 30, C_TEXT_MAIN);
+                        visSprite.fillCircle(cx, cy - 8, 4, C_BG_DARK); visSprite.drawCircle(cx, cy - 8, 2, C_BG_LIGHT);
+                        visSprite.fillCircle(cx, cy + 4, 12, C_BG_DARK); visSprite.fillCircle(cx, cy + 4, r, C_TEXT_DIM);
+                        visSprite.fillCircle(cx, cy + 4, r - 3, C_BG_DARK); visSprite.fillCircle(cx, cy + 4, 3, C_ACCENT);
                         break;
                     }
                     case 3: {
-                        // --- 4. SPINNING CD ---
-                        int r = 16;
-                        float angle = millis() / 300.0;
-                        visSprite.fillCircle(cx, cy, r, C_TEXT_MAIN); // Silver disc
-                        visSprite.drawCircle(cx, cy, r, C_TEXT_DIM);
-                        
-                        // Sweeping Reflection 1
-                        float a2 = angle + PI/4; 
+                        int r = 16; float angle = millis() / 300.0;
+                        visSprite.fillCircle(cx, cy, r, C_TEXT_MAIN); visSprite.drawCircle(cx, cy, r, C_TEXT_DIM);
+                        float a2 = angle + PI/4;
                         visSprite.fillTriangle(cx, cy, cx + cos(angle)*r, cy + sin(angle)*r, cx + cos(a2)*r, cy + sin(a2)*r, C_HIGHLIGHT);
-                        
-                        // Sweeping Reflection 2 (opposite side)
-                        float a3 = angle + PI;
-                        float a4 = angle + PI + PI/4;
+                        float a3 = angle + PI, a4 = angle + PI + PI/4;
                         visSprite.fillTriangle(cx, cy, cx + cos(a3)*r, cy + sin(a3)*r, cx + cos(a4)*r, cy + sin(a4)*r, C_ACCENT);
-                        
-                        // Center Rings & Hole
-                        visSprite.fillCircle(cx, cy, 6, C_BG_DARK);
-                        visSprite.drawCircle(cx, cy, 6, C_TEXT_DIM);
-                        visSprite.fillCircle(cx, cy, 2, C_BG_LIGHT); // Transparent hole
+                        visSprite.fillCircle(cx, cy, 6, C_BG_DARK); visSprite.drawCircle(cx, cy, 6, C_TEXT_DIM); visSprite.fillCircle(cx, cy, 2, C_BG_LIGHT);
                         break;
                     }
                 }
-
-                // 2. Format the Text (Artist, Album, Time)
                 String artist = audioApp.currentArtist.length() > 0 ? audioApp.currentArtist : "Unknown Artist";
                 String album = audioApp.currentAlbum.length() > 0 ? audioApp.currentAlbum : "Unknown Album";
-                
                 visSprite.setFont(&fonts::Font0);
-                
-                // Artist Name
-                visSprite.setTextColor(C_TEXT_MAIN);
-                visSprite.setCursor(45, 4);
-                visSprite.print(artist.substring(0, 12)); 
-                
-                // Album Name
-                visSprite.setTextColor(C_TEXT_DIM);
-                visSprite.setCursor(45, 16);
-                visSprite.print(album.substring(0, 12));
-                
-                // 3. Calculate Playback Time 
+                visSprite.setTextColor(C_TEXT_MAIN); visSprite.setCursor(45, 4); visSprite.print(artist.substring(0, 12));
+                visSprite.setTextColor(C_TEXT_DIM); visSprite.setCursor(45, 16); visSprite.print(album.substring(0, 12));
                 int elapsedSec = 0, totalSec = 0;
                 if (audioApp.id3 && audioApp.id3->getSize() > 0) {
                     elapsedSec = audioApp.id3->getPos() / 16000;
                     totalSec = audioApp.id3->getSize() / 16000;
                 }
-                
                 char timeStr[16];
                 sprintf(timeStr, "%02d:%02d/%02d:%02d", elapsedSec / 60, elapsedSec % 60, totalSec / 60, totalSec % 60);
-                
-                visSprite.setTextColor(C_HIGHLIGHT);
-                visSprite.setCursor(45, 28);
-                visSprite.print(timeStr);
-
-                // Push to screen
+                visSprite.setTextColor(C_HIGHLIGHT); visSprite.setCursor(45, 28); visSprite.print(timeStr);
                 visSprite.pushSprite(PLAYLIST_WIDTH + 2, HEADER_HEIGHT + 55);
                 return;
             }
             memcpy(raw_data, buf, WAVE_SIZE * 2 * sizeof(int16_t)); 
             fft.exec(raw_data); 
             visSprite.fillScreen(C_BG_DARK); 
-            int visW = visSprite.width();
-            int visH = visSprite.height();
+            int visW = visSprite.width(), visH = visSprite.height();
 
             if (userSettings.visMode == 0) {
-                // --- MODE 0: CLASSIC BARS ---
                 for (size_t bx = 0; bx < min((int)(visW / 4), FFT_SIZE / 2); ++bx) {
                     int32_t barH = min((int)((fft.get(bx) * visH) >> 16), visH);
                     uint16_t color = barH < visH * 0.4 ? C_ACCENT : (barH < visH * 0.7 ? C_HIGHLIGHT : TFT_RED);
@@ -774,56 +884,34 @@ public:
                 }
             } 
             else if (userSettings.visMode == 1) {
-                // --- MODE 1: WAVEFORM LINE ---
                 int prevX = 0, prevY = visH;
                 int numPoints = min((int)visW, FFT_SIZE / 2);
                 float step = (float)visW / numPoints;
-                
-                for (size_t bx = 0; bx < numPoints; ++bx) {
+                for (size_t bx = 0; bx < (size_t)numPoints; ++bx) {
                     int32_t val = min((int)((fft.get(bx) * visH) >> 16), visH);
-                    int x = (int)(bx * step);
-                    int y = visH - val;
+                    int x = (int)(bx * step), y = visH - val;
                     if (bx > 0) visSprite.drawLine(prevX, prevY, x, y, C_ACCENT);
-                    
-                    // Optional: Add a light fill under the line
-                    visSprite.drawLine(x, y, x, visH, C_BG_LIGHT); 
+                    visSprite.drawLine(x, y, x, visH, C_BG_LIGHT);
                     prevX = x; prevY = y;
                 }
             }
             else if (userSettings.visMode == 2) {
-                // --- MODE 2: CIRCULAR SPIKES ---
-                int cx = visW / 2;
-                int cy = visH / 2;
-                int baseR = 12; // Radius of the inner circle
-                int numBins = 32; // Limit bins so the circle isn't too crowded
+                int cx = visW / 2, cy = visH / 2, baseR = 12, numBins = 32;
                 float angleStep = 2.0 * PI / numBins;
-
-                // Draw the reacting spikes
                 for (int i = 0; i < numBins; i++) {
-                    // Grab lower frequencies to make it punchy, scale it down slightly
                     int32_t val = min((int)((fft.get(i) * (visH / 2)) >> 16), visH / 2);
                     float angle = i * angleStep;
-                    
-                    int x1 = cx + cos(angle) * baseR;
-                    int y1 = cy + sin(angle) * baseR;
-                    int x2 = cx + cos(angle) * (baseR + val);
-                    int y2 = cy + sin(angle) * (baseR + val);
-
+                    int x1 = cx + cos(angle) * baseR, y1 = cy + sin(angle) * baseR;
+                    int x2 = cx + cos(angle) * (baseR + val), y2 = cy + sin(angle) * (baseR + val);
                     uint16_t color = val < (visH / 4) ? C_ACCENT : C_HIGHLIGHT;
                     visSprite.drawLine(x1, y1, x2, y2, color);
-                    
-                    // Draw a mirrored spike for symmetry on the other side of the circle
                     float mirrorAngle = angle + PI;
-                    int mx1 = cx + cos(mirrorAngle) * baseR;
-                    int my1 = cy + sin(mirrorAngle) * baseR;
-                    int mx2 = cx + cos(mirrorAngle) * (baseR + val);
-                    int my2 = cy + sin(mirrorAngle) * (baseR + val);
+                    int mx1 = cx + cos(mirrorAngle) * baseR, my1 = cy + sin(mirrorAngle) * baseR;
+                    int mx2 = cx + cos(mirrorAngle) * (baseR + val), my2 = cy + sin(mirrorAngle) * (baseR + val);
                     visSprite.drawLine(mx1, my1, mx2, my2, color);
                 }
-                // Draw the solid inner ring
                 visSprite.drawCircle(cx, cy, baseR, C_PLAYING);
             }
-
             visSprite.pushSprite(PLAYLIST_WIDTH + 2, HEADER_HEIGHT + 55);
         }
     }
@@ -852,9 +940,111 @@ public:
                 case 11: M5Cardputer.Display.print("> Setup AP (Host)"); break;
                 case 12: M5Cardputer.Display.print("[ RESCAN LIBRARY ]"); break;    
                 case 13: M5Cardputer.Display.print("[ EXPORT CONFIG TO SD ]"); break; 
-                case 14: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;      
+                case 14: M5Cardputer.Display.print("[ IMPORT FROM SD ]"); break;
+                case 15: {
+                    String flabel = userSettings.currentFolder == "" ? "All Music" : userSettings.currentFolder;
+                    if (flabel.startsWith("/")) flabel = flabel.substring(1);
+                    if (flabel.length() > 12) flabel = flabel.substring(0, 12) + "~";
+                    M5Cardputer.Display.printf("Playlist: %s", flabel.c_str()); break;
+                }
             }
         }
+    }
+
+    // -----------------------------------------------
+    // FOLDER BROWSER (UI_FOLDER_SELECT)
+    // -----------------------------------------------
+    static void buildFolderList() {
+        folderList = audioApp.listRootFolders();
+        folderCursor = 0;
+        folderScrollOffset = 0;
+        // Pre-select current folder
+        for (int i = 0; i < (int)folderList.size(); i++) {
+            if (folderList[i] == userSettings.currentFolder) { folderCursor = i; break; }
+        }
+        if (folderCursor >= (int)folderList.size()) folderCursor = 0;
+        // Adjust scroll
+        if (folderCursor >= folderScrollOffset + MAX_VISIBLE_ROWS)
+            folderScrollOffset = folderCursor - MAX_VISIBLE_ROWS + 1;
+    }
+
+    static void drawFolderSelect() {
+        M5Cardputer.Display.fillScreen(C_BG_DARK);
+        // Header
+        M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
+        M5Cardputer.Display.setCursor(5, 5);
+        M5Cardputer.Display.print("Select Playlist / Folder");
+
+        int yPos = HEADER_HEIGHT + 4;
+        int totalFolders = folderList.size();
+
+        if (totalFolders == 0) {
+            M5Cardputer.Display.setCursor(10, yPos);
+            M5Cardputer.Display.setTextColor(C_TEXT_DIM);
+            M5Cardputer.Display.print("No folders found.");
+        } else {
+            for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
+                int idx = folderScrollOffset + i;
+                if (idx >= totalFolders) break;
+
+                bool isSelected = (idx == folderCursor);
+                bool isCurrent  = (folderList[idx] == userSettings.currentFolder);
+
+                if (isSelected) {
+                    M5Cardputer.Display.fillRect(2, yPos - 1, M5Cardputer.Display.width() - 4, ROW_HEIGHT, C_ACCENT);
+                    M5Cardputer.Display.setTextColor(C_BG_DARK);
+                } else if (isCurrent) {
+                    M5Cardputer.Display.setTextColor(C_PLAYING);
+                } else {
+                    M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
+                }
+
+                M5Cardputer.Display.setCursor(8, yPos + 2);
+
+                // Show cache status badge
+                String cachePath = getPlaylistPath(folderList[idx]);
+                bool hasCached = SD.exists(cachePath);
+
+                String label;
+                if (folderList[idx] == "") {
+                    label = "[All Music]";
+                } else {
+                    label = folderList[idx];
+                    if (label.startsWith("/")) label = label.substring(1);
+                }
+                if (label.length() > 20) label = label.substring(0, 20) + "~";
+
+                M5Cardputer.Display.print(label);
+
+                // Cache indicator on the right
+                M5Cardputer.Display.setCursor(M5Cardputer.Display.width() - 18, yPos + 2);
+                if (hasCached) {
+                    M5Cardputer.Display.setTextColor(isSelected ? C_BG_DARK : C_PLAYING);
+                    M5Cardputer.Display.print("*");
+                } else {
+                    M5Cardputer.Display.setTextColor(isSelected ? C_BG_DARK : C_TEXT_DIM);
+                    M5Cardputer.Display.print("?");
+                }
+
+                yPos += ROW_HEIGHT;
+            }
+
+            // Scroll arrows
+            M5Cardputer.Display.setTextColor(C_ACCENT);
+            if (folderScrollOffset > 0)
+                M5Cardputer.Display.drawString("^", M5Cardputer.Display.width() - 10, HEADER_HEIGHT + 4);
+            if (folderScrollOffset + MAX_VISIBLE_ROWS < totalFolders)
+                M5Cardputer.Display.drawString("v", M5Cardputer.Display.width() - 10, HEADER_HEIGHT + (MAX_VISIBLE_ROWS * ROW_HEIGHT) - 6);
+        }
+
+        // Footer
+        int footerY = M5Cardputer.Display.height() - BOTTOM_BAR_HEIGHT;
+        M5Cardputer.Display.fillRect(0, footerY, M5Cardputer.Display.width(), BOTTOM_BAR_HEIGHT, C_HEADER);
+        M5Cardputer.Display.setTextColor(C_TEXT_DIM, C_HEADER);
+        M5Cardputer.Display.setCursor(5, footerY + 4);
+        M5Cardputer.Display.print("Enter:Load  R:Rescan  `:Back");
     }
 
     static void drawWifiScanner() {
@@ -881,7 +1071,7 @@ public:
         M5Cardputer.Display.setTextColor(C_TEXT_MAIN); M5Cardputer.Display.setCursor(15, HEADER_HEIGHT + 40);
         
         String displayStr = enteredText;
-        if (textInputTarget == 0) { displayStr = ""; for(int i=0; i<enteredText.length(); i++) displayStr += "*"; }
+        if (textInputTarget == 0) { displayStr = ""; for(int i=0; i<(int)enteredText.length(); i++) displayStr += "*"; }
         M5Cardputer.Display.print(displayStr + "_"); 
         M5Cardputer.Display.setCursor(10, M5Cardputer.Display.height() - 20); M5Cardputer.Display.setTextColor(C_TEXT_DIM); M5Cardputer.Display.print("ENTER to Save  |  ` to Cancel");
     }
@@ -896,6 +1086,9 @@ public:
 int UIManager::settingsCursor = 0; int UIManager::menuScrollOffset = 0; bool UIManager::showVisualizer = true;
 int UIManager::wifiCursor = 0; int UIManager::wifiScrollOffset = 0; int UIManager::wifiNetworkCount = 0;
 int UIManager::helpScrollOffset = 0;
+std::vector<String> UIManager::folderList;
+int UIManager::folderCursor = 0;
+int UIManager::folderScrollOffset = 0;
 
 void AudioEngine::MDCallback(void *cbData, const char *type, bool isUnicode, const char *string) {
     if (string[0] == 0) return;
@@ -987,9 +1180,9 @@ player.addEventListener('ended',playNext);
         });
 
         server.on("/api/songs", []() {
-            if (!SD.exists(PLAYLIST_FILE)) { server.send(500, "text/plain", "No Playlist"); return; }
+            if (!SD.exists(g_activePlaylist)) { server.send(500, "text/plain", "No Playlist"); return; }
             server.setContentLength(CONTENT_LENGTH_UNKNOWN); server.send(200, "application/json", ""); server.sendContent("[\n");
-            File f = SD.open(PLAYLIST_FILE); String jsonBuffer = ""; bool first = true;
+            File f = SD.open(g_activePlaylist); String jsonBuffer = ""; bool first = true;
             while (f.available()) {
                 String line = f.readStringUntil('\n'); line.trim(); int slashIdx = line.lastIndexOf('/'); if (slashIdx >= 0) line = line.substring(slashIdx + 1);
                 line.replace("\"", "\\\"");
@@ -1031,6 +1224,804 @@ player.addEventListener('ended',playNext);
 };
 
 // ==========================================
+// BOOT MENU
+// ==========================================
+class BootMenu {
+public:
+    static int menuCursor;
+    
+    static void resetPreferences() {
+        preferences.begin("sam_music", false);
+        preferences.clear();
+        preferences.end();
+        
+        M5Cardputer.Display.fillScreen(TFT_BLACK);
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(TFT_GREEN);
+        M5Cardputer.Display.setCursor(40, 50);
+        M5Cardputer.Display.print("Preferences Reset!");
+        M5Cardputer.Display.setTextColor(TFT_WHITE);
+        M5Cardputer.Display.setCursor(30, 70);
+        M5Cardputer.Display.print("Restarting in 2 sec...");
+        delay(2000);
+        ESP.restart();
+    }
+    
+    static USBMSC msc;
+    static sdcard_type_t sdCardType;
+    static uint32_t sdSectorCount;
+    static uint32_t sdSectorSize;
+    static SPIClass* sdSPI;
+    
+    static int32_t onMSCRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
+        // Optimized multi-sector read
+        uint32_t count = bufsize / 512;
+        uint8_t* buf = (uint8_t*)buffer;
+        
+        // Try batch read first for better performance
+        for (uint32_t i = 0; i < count; i++) {
+            if (!SD.readRAW(buf + (i * 512), lba + i)) {
+                return -1;
+            }
+        }
+        return bufsize;
+    }
+    
+    static int32_t onMSCWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+        // Optimized multi-sector write
+        uint32_t count = bufsize / 512;
+        
+        for (uint32_t i = 0; i < count; i++) {
+            if (!SD.writeRAW(buffer + (i * 512), lba + i)) {
+                return -1;
+            }
+        }
+        return bufsize;
+    }
+    
+    static bool onMSCStartStop(uint8_t power_condition, bool start, bool load_eject) {
+        return true;
+    }
+    
+    static void enableMassStorage() {
+        M5Cardputer.Display.fillScreen(TFT_BLACK);
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(0x07FF);
+        M5Cardputer.Display.setCursor(30, 25);
+        M5Cardputer.Display.print("USB Mass Storage Mode");
+        M5Cardputer.Display.setTextColor(TFT_WHITE);
+        M5Cardputer.Display.setCursor(10, 50);
+        M5Cardputer.Display.print("Initializing USB MSC...");
+        
+        // Get SD card info
+        sdCardType = SD.cardType();
+        sdSectorSize = 512;
+        sdSectorCount = SD.cardSize() / sdSectorSize;
+        
+        if (sdCardType == CARD_NONE || sdSectorCount == 0) {
+            M5Cardputer.Display.fillScreen(TFT_BLACK);
+            M5Cardputer.Display.setTextColor(TFT_RED);
+            M5Cardputer.Display.setCursor(30, 50);
+            M5Cardputer.Display.print("SD Card Error!");
+            M5Cardputer.Display.setTextColor(TFT_WHITE);
+            M5Cardputer.Display.setCursor(20, 75);
+            M5Cardputer.Display.print("Press RESET to retry");
+            while(true) { delay(100); }
+        }
+        
+        // Increase SPI speed for faster transfers
+        SPI.setFrequency(40000000); // 40MHz for faster USB transfers
+        
+        msc.vendorID("M5Stack");
+        msc.productID("Cardputer");
+        msc.productRevision("1.0");
+        msc.onRead(onMSCRead);
+        msc.onWrite(onMSCWrite);
+        msc.onStartStop(onMSCStartStop);
+        msc.mediaPresent(true);
+        msc.isWritable(true);
+        msc.begin(sdSectorCount, sdSectorSize);
+        
+        USB.begin();
+        
+        M5Cardputer.Display.fillScreen(TFT_BLACK);
+        M5Cardputer.Display.setTextColor(0x07E0);
+        M5Cardputer.Display.setCursor(20, 25);
+        M5Cardputer.Display.print("USB MSC Active!");
+        M5Cardputer.Display.setTextColor(TFT_WHITE);
+        M5Cardputer.Display.setCursor(10, 50);
+        M5Cardputer.Display.print("SD Card: ");
+        M5Cardputer.Display.print(SD.cardSize() / (1024 * 1024));
+        M5Cardputer.Display.print(" MB");
+        M5Cardputer.Display.setCursor(10, 70);
+        M5Cardputer.Display.print("Connect USB to PC now");
+        M5Cardputer.Display.setTextColor(TFT_YELLOW);
+        M5Cardputer.Display.setCursor(15, 95);
+        M5Cardputer.Display.print("Press RESET to exit");
+        M5Cardputer.Display.setTextColor(0x07FF);
+        M5Cardputer.Display.setCursor(30, 115);
+        M5Cardputer.Display.print("Mode Active...");
+        
+        while(true) {
+            M5Cardputer.update();
+            delay(100);
+        }
+    }
+    
+    static void draw() {
+        M5Cardputer.Display.fillScreen(TFT_BLACK);
+        
+        // Header
+        M5Cardputer.Display.fillRect(0, 0, 240, 25, 0x18E3);
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(0x07FF, 0x18E3); // Cyan
+        M5Cardputer.Display.setCursor(60, 8);
+        M5Cardputer.Display.print("BOOT MENU");
+        
+        // Menu options
+        const char* options[] = {
+            "Continue Normal Boot",
+            "Reset All Preferences", 
+            "USB Mass Storage Mode"
+        };
+        int numOptions = 3;
+        
+        int startY = 40;
+        int rowHeight = 25;
+        
+        for (int i = 0; i < numOptions; i++) {
+            int y = startY + (i * rowHeight);
+            
+            if (i == menuCursor) {
+                M5Cardputer.Display.fillRoundRect(10, y, 220, 20, 3, 0x05BF); // Accent blue
+                M5Cardputer.Display.setTextColor(TFT_BLACK);
+            } else {
+                M5Cardputer.Display.setTextColor(TFT_WHITE);
+            }
+            
+            M5Cardputer.Display.setCursor(20, y + 5);
+            M5Cardputer.Display.print(options[i]);
+            
+            // Add icons/indicators
+            if (i == 1) {
+                M5Cardputer.Display.setTextColor(i == menuCursor ? TFT_BLACK : TFT_RED);
+                M5Cardputer.Display.setCursor(200, y + 5);
+                M5Cardputer.Display.print("!");
+            } else if (i == 2) {
+                M5Cardputer.Display.setTextColor(i == menuCursor ? TFT_BLACK : TFT_GREEN);
+                M5Cardputer.Display.setCursor(200, y + 5);
+                M5Cardputer.Display.print("U");
+            }
+        }
+        
+        // Footer instructions
+        M5Cardputer.Display.fillRect(0, 117, 240, 18, 0x18E3);
+        M5Cardputer.Display.setTextColor(0x9492, 0x18E3);
+        M5Cardputer.Display.setCursor(5, 121);
+        M5Cardputer.Display.print(";/. Navigate  Enter:Select");
+    }
+    
+    static bool show() {
+        menuCursor = 0;
+        draw();
+        
+        while (true) {
+            M5Cardputer.update();
+            
+            if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+                if (M5Cardputer.Keyboard.isKeyPressed(';')) {
+                    // Up
+                    menuCursor--;
+                    if (menuCursor < 0) menuCursor = 2;
+                    draw();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('.')) {
+                    // Down
+                    menuCursor++;
+                    if (menuCursor > 2) menuCursor = 0;
+                    draw();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
+                    switch (menuCursor) {
+                        case 0: // Continue normal boot
+                            return true;
+                        case 1: // Reset preferences
+                            resetPreferences();
+                            return false; // Won't reach here due to restart
+                        case 2: // USB Mass Storage
+                            enableMassStorage();
+                            return false; // Won't reach here
+                    }
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('`')) {
+                    // Escape - continue normal boot
+                    return true;
+                }
+            }
+            delay(50);
+        }
+        return true;
+    }
+};
+
+int BootMenu::menuCursor = 0;
+USBMSC BootMenu::msc;
+sdcard_type_t BootMenu::sdCardType = CARD_NONE;
+uint32_t BootMenu::sdSectorCount = 0;
+uint32_t BootMenu::sdSectorSize = 512;
+
+// ==========================================
+// SPLASH SCREEN ANIMATION - 8-BIT NES STYLE
+// ==========================================
+class SplashScreen {
+public:
+    // NES-style color palette (limited colors like real NES)
+    static const uint16_t NES_BLACK = 0x0000;
+    static const uint16_t NES_WHITE = 0xFFFF;
+    static const uint16_t NES_SKY = 0x5DBF;      // Light blue sky
+    static const uint16_t NES_SKIN = 0xFCC0;     // Peach skin
+    static const uint16_t NES_BROWN = 0x8200;    // Brown
+    static const uint16_t NES_RED = 0xF800;      // Bright red
+    static const uint16_t NES_BLUE = 0x001F;     // Blue
+    static const uint16_t NES_GREEN = 0x07C0;    // Green
+    static const uint16_t NES_DKGREEN = 0x03C0;  // Dark green
+    static const uint16_t NES_YELLOW = 0xFFE0;   // Yellow
+    static const uint16_t NES_ORANGE = 0xFC00;   // Orange
+    static const uint16_t NES_GRAY = 0x8410;     // Gray
+    static const uint16_t NES_DKGRAY = 0x4208;   // Dark gray
+    static const uint16_t NES_CYAN = 0x07FF;     // Cyan
+    static const uint16_t NES_MAGENTA = 0xF81F;  // Magenta
+    
+    // Pixel size for chunky 8-bit look (2x2 or 3x3 pixels)
+    static const int PX = 2;
+    
+    // Draw a single "big pixel" (NES style chunky pixel)
+    static void px(int x, int y, uint16_t c) {
+        M5Cardputer.Display.fillRect(x * PX, y * PX, PX, PX, c);
+    }
+    
+    // Draw 8-bit style character sprite (16x24 pixels, scaled)
+    // Frame 0 = standing/walk1, Frame 1 = walk2
+    static void drawBoy8bit(int x, int y, int frame) {
+        // Clear sprite area first
+        M5Cardputer.Display.fillRect(x * PX - PX, y * PX, 18 * PX, 26 * PX, NES_SKY);
+        
+        int f = frame % 4; // 4 frame walk cycle
+        
+        // Hair (dark brown) - row 0-2
+        for(int i = 2; i < 7; i++) px(x+i, y, NES_DKGRAY);
+        for(int i = 1; i < 8; i++) px(x+i, y+1, NES_DKGRAY);
+        for(int i = 1; i < 8; i++) px(x+i, y+2, NES_DKGRAY);
+        
+        // Face (skin color) - row 3-6
+        for(int i = 1; i < 8; i++) px(x+i, y+3, NES_SKIN);
+        // Eyes row
+        px(x+1, y+4, NES_SKIN); px(x+2, y+4, NES_BLACK); px(x+3, y+4, NES_SKIN);
+        px(x+4, y+4, NES_SKIN); px(x+5, y+4, NES_BLACK); px(x+6, y+4, NES_SKIN);
+        px(x+7, y+4, NES_SKIN);
+        // Below eyes
+        for(int i = 1; i < 8; i++) px(x+i, y+5, NES_SKIN);
+        // Mouth row - smile
+        px(x+1, y+6, NES_SKIN); px(x+2, y+6, NES_SKIN); px(x+3, y+6, NES_BLACK);
+        px(x+4, y+6, NES_BLACK); px(x+5, y+6, NES_SKIN); px(x+6, y+6, NES_SKIN);
+        px(x+7, y+6, NES_SKIN);
+        
+        // Headphones - RED ear cups
+        px(x, y+3, NES_RED); px(x, y+4, NES_RED); px(x, y+5, NES_RED);
+        px(x+8, y+3, NES_RED); px(x+8, y+4, NES_RED); px(x+8, y+5, NES_RED);
+        // Headphone band on top
+        for(int i = 1; i < 8; i++) px(x+i, y-1, NES_RED);
+        
+        // Body/Shirt (Blue) - row 7-11
+        for(int j = 7; j <= 11; j++) {
+            for(int i = 2; i < 7; i++) px(x+i, y+j, NES_BLUE);
+        }
+        
+        // Arms (skin) - animated swing
+        int armOffset = (f < 2) ? 0 : 1;
+        // Left arm
+        px(x+1, y+7+armOffset, NES_SKIN); px(x+1, y+8+armOffset, NES_SKIN);
+        px(x+1, y+9+armOffset, NES_SKIN);
+        // Right arm
+        px(x+7, y+7+(1-armOffset), NES_SKIN); px(x+7, y+8+(1-armOffset), NES_SKIN);
+        px(x+7, y+9+(1-armOffset), NES_SKIN);
+        
+        // Pants (dark gray) - row 12-14
+        for(int j = 12; j <= 14; j++) {
+            for(int i = 2; i < 7; i++) px(x+i, y+j, NES_DKGRAY);
+        }
+        
+        // Legs with walk animation
+        int legL = 0, legR = 0;
+        switch(f) {
+            case 0: legL = 0; legR = 2; break;  // Left back, right forward
+            case 1: legL = 1; legR = 1; break;  // Both center
+            case 2: legL = 2; legR = 0; break;  // Left forward, right back
+            case 3: legL = 1; legR = 1; break;  // Both center
+        }
+        // Left leg + shoe
+        px(x+2+legL, y+15, NES_DKGRAY); px(x+2+legL, y+16, NES_DKGRAY);
+        px(x+2+legL, y+17, NES_BROWN); px(x+3+legL, y+17, NES_BROWN); // shoe
+        // Right leg + shoe
+        px(x+5-legR, y+15, NES_DKGRAY); px(x+5-legR, y+16, NES_DKGRAY);
+        px(x+5-legR, y+17, NES_BROWN); px(x+6-legR, y+17, NES_BROWN); // shoe
+    }
+    
+    // 8-bit music note (simple pixelated)
+    static void drawNote8bit(int x, int y, uint16_t color) {
+        // Note head
+        px(x, y+2, color); px(x+1, y+2, color);
+        px(x, y+3, color); px(x+1, y+3, color);
+        // Stem
+        px(x+1, y, color); px(x+1, y+1, color);
+        // Flag
+        px(x+2, y, color); px(x+2, y+1, color);
+    }
+    
+    // 8-bit double note (beamed)
+    static void drawDoubleNote8bit(int x, int y, uint16_t color) {
+        // First note head
+        px(x, y+2, color); px(x+1, y+2, color);
+        // Second note head
+        px(x+3, y+2, color); px(x+4, y+2, color);
+        // Stems
+        px(x+1, y, color); px(x+1, y+1, color);
+        px(x+4, y, color); px(x+4, y+1, color);
+        // Beam
+        px(x+1, y, color); px(x+2, y, color); px(x+3, y, color); px(x+4, y, color);
+    }
+    
+    // 8-bit house
+    static void drawHouse8bit(int hx, int hy) {
+        // Roof (red/brown triangle approximation in pixels)
+        for(int i = 0; i < 8; i++) {
+            for(int j = 8-i; j <= 8+i; j++) {
+                px(hx+j, hy+i, NES_RED);
+            }
+        }
+        // Walls (gray)
+        for(int j = 8; j < 16; j++) {
+            for(int i = 1; i < 16; i++) {
+                px(hx+i, hy+j, NES_GRAY);
+            }
+        }
+        // Door (brown)
+        for(int j = 10; j < 16; j++) {
+            px(hx+7, hy+j, NES_BROWN); px(hx+8, hy+j, NES_BROWN); px(hx+9, hy+j, NES_BROWN);
+        }
+        // Door knob
+        px(hx+9, hy+13, NES_YELLOW);
+        // Windows (cyan with white cross)
+        px(hx+3, hy+10, NES_CYAN); px(hx+4, hy+10, NES_CYAN);
+        px(hx+3, hy+11, NES_CYAN); px(hx+4, hy+11, NES_CYAN);
+        px(hx+12, hy+10, NES_CYAN); px(hx+13, hy+10, NES_CYAN);
+        px(hx+12, hy+11, NES_CYAN); px(hx+13, hy+11, NES_CYAN);
+        // Chimney
+        px(hx+12, hy+2, NES_BROWN); px(hx+13, hy+2, NES_BROWN);
+        px(hx+12, hy+3, NES_BROWN); px(hx+13, hy+3, NES_BROWN);
+        px(hx+12, hy+4, NES_BROWN); px(hx+13, hy+4, NES_BROWN);
+    }
+    
+    // 8-bit tree
+    static void drawTree8bit(int tx, int ty) {
+        // Trunk (brown)
+        px(tx+2, ty+6, NES_BROWN); px(tx+3, ty+6, NES_BROWN);
+        px(tx+2, ty+7, NES_BROWN); px(tx+3, ty+7, NES_BROWN);
+        px(tx+2, ty+8, NES_BROWN); px(tx+3, ty+8, NES_BROWN);
+        // Leaves (green - triangle-ish)
+        for(int i = 0; i < 6; i++) px(tx+i, ty+5, NES_GREEN);
+        for(int i = 0; i < 6; i++) px(tx+i, ty+4, NES_GREEN);
+        for(int i = 1; i < 5; i++) px(tx+i, ty+3, NES_GREEN);
+        for(int i = 1; i < 5; i++) px(tx+i, ty+2, NES_DKGREEN);
+        px(tx+2, ty+1, NES_DKGREEN); px(tx+3, ty+1, NES_DKGREEN);
+        px(tx+2, ty, NES_GREEN); px(tx+3, ty, NES_GREEN);
+    }
+    
+    // 8-bit cloud
+    static void drawCloud8bit(int cx, int cy) {
+        // Simple blocky cloud
+        for(int i = 1; i < 6; i++) px(cx+i, cy, NES_WHITE);
+        for(int i = 0; i < 7; i++) px(cx+i, cy+1, NES_WHITE);
+        for(int i = 1; i < 6; i++) px(cx+i, cy+2, NES_WHITE);
+    }
+    
+    // 8-bit sun
+    static void drawSun8bit(int sx, int sy, int frame) {
+        // Sun body
+        for(int j = 0; j < 4; j++) {
+            for(int i = 0; i < 4; i++) {
+                px(sx+i, sy+j, NES_YELLOW);
+            }
+        }
+        // Animated rays (alternating pattern)
+        int rayPhase = (frame / 5) % 2;
+        if(rayPhase == 0) {
+            px(sx+1, sy-1, NES_YELLOW); px(sx+2, sy-1, NES_YELLOW);
+            px(sx-1, sy+1, NES_YELLOW); px(sx+4, sy+1, NES_YELLOW);
+            px(sx-1, sy+2, NES_YELLOW); px(sx+4, sy+2, NES_YELLOW);
+            px(sx+1, sy+4, NES_YELLOW); px(sx+2, sy+4, NES_YELLOW);
+        } else {
+            px(sx-1, sy-1, NES_ORANGE); px(sx+4, sy-1, NES_ORANGE);
+            px(sx+1, sy-1, NES_YELLOW); px(sx+2, sy-1, NES_YELLOW);
+            px(sx-1, sy+4, NES_ORANGE); px(sx+4, sy+4, NES_ORANGE);
+            px(sx+1, sy+4, NES_YELLOW); px(sx+2, sy+4, NES_YELLOW);
+        }
+    }
+    
+    // 8-bit ground with grass detail
+    static void drawGround8bit() {
+        // Grass layer
+        int groundY = 52;
+        for(int y = groundY; y < groundY + 5; y++) {
+            for(int x = 0; x < 120; x++) {
+                px(x, y, NES_GREEN);
+            }
+        }
+        // Grass detail (darker patches)
+        for(int x = 0; x < 120; x += 5) {
+            px(x, groundY, NES_DKGREEN);
+            px(x+2, groundY, NES_DKGREEN);
+        }
+        // Path/road
+        for(int y = groundY + 5; y < 68; y++) {
+            for(int x = 0; x < 120; x++) {
+                px(x, y, NES_DKGRAY);
+            }
+        }
+        // Road stripes (yellow dashes)
+        for(int x = 0; x < 120; x += 10) {
+            for(int i = 0; i < 5; i++) {
+                px(x+i, groundY + 8, NES_YELLOW);
+            }
+        }
+    }
+    
+    // Draw retro 8-bit title with pixel font effect
+    static void drawTitle8bit(int frame) {
+        // Title background bar
+        M5Cardputer.Display.fillRect(0, 0, 240, 22, NES_BLACK);
+        
+        // "SAM MUSIC PLAYER" - simple pixel text with color cycling
+        uint16_t colors[] = {NES_CYAN, NES_WHITE, NES_YELLOW, NES_MAGENTA};
+        uint16_t titleColor = colors[(frame / 10) % 4];
+        
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setTextColor(titleColor);
+        M5Cardputer.Display.setCursor(45, 7);
+        M5Cardputer.Display.print("SAM MUSIC PLAYER");
+        
+        // Decorative pixels around title (NES style)
+        px(10, 3, NES_CYAN); px(11, 4, NES_MAGENTA); px(10, 5, NES_YELLOW);
+        px(108, 3, NES_CYAN); px(109, 4, NES_MAGENTA); px(108, 5, NES_YELLOW);
+    }
+    
+    // Draw "LOADING" with animated dots
+    static void drawLoading8bit(int frame) {
+        M5Cardputer.Display.fillRect(75, 122, 90, 12, NES_BLACK);
+        M5Cardputer.Display.setTextColor(NES_WHITE);
+        M5Cardputer.Display.setCursor(80, 124);
+        M5Cardputer.Display.print("LOADING");
+        
+        int dots = (frame / 8) % 4;
+        for(int d = 0; d < dots; d++) {
+            M5Cardputer.Display.print(".");
+        }
+        
+        // Animated loading bar (NES style)
+        int barX = 80;
+        int barY = 118;
+        int barW = 80;
+        int progress = (frame * barW) / 60;
+        if(progress > barW) progress = barW;
+        
+        M5Cardputer.Display.drawRect(barX, barY, barW, 4, NES_WHITE);
+        M5Cardputer.Display.fillRect(barX + 1, barY + 1, progress - 2, 2, NES_CYAN);
+    }
+    
+    // Sprite-based drawing functions for double buffering
+    static LGFX_Sprite* splashSprite;
+    
+    static void spx(int x, int y, uint16_t c) {
+        splashSprite->fillRect(x * PX, y * PX, PX, PX, c);
+    }
+    
+    static void drawBoy8bitSprite(int x, int y, int frame) {
+        int f = frame % 4;
+        
+        // Hair
+        for(int i = 2; i < 7; i++) spx(x+i, y, NES_DKGRAY);
+        for(int i = 1; i < 8; i++) spx(x+i, y+1, NES_DKGRAY);
+        for(int i = 1; i < 8; i++) spx(x+i, y+2, NES_DKGRAY);
+        
+        // Face
+        for(int i = 1; i < 8; i++) spx(x+i, y+3, NES_SKIN);
+        spx(x+1, y+4, NES_SKIN); spx(x+2, y+4, NES_BLACK); spx(x+3, y+4, NES_SKIN);
+        spx(x+4, y+4, NES_SKIN); spx(x+5, y+4, NES_BLACK); spx(x+6, y+4, NES_SKIN);
+        spx(x+7, y+4, NES_SKIN);
+        for(int i = 1; i < 8; i++) spx(x+i, y+5, NES_SKIN);
+        spx(x+1, y+6, NES_SKIN); spx(x+2, y+6, NES_SKIN); spx(x+3, y+6, NES_BLACK);
+        spx(x+4, y+6, NES_BLACK); spx(x+5, y+6, NES_SKIN); spx(x+6, y+6, NES_SKIN);
+        spx(x+7, y+6, NES_SKIN);
+        
+        // Headphones
+        spx(x, y+3, NES_RED); spx(x, y+4, NES_RED); spx(x, y+5, NES_RED);
+        spx(x+8, y+3, NES_RED); spx(x+8, y+4, NES_RED); spx(x+8, y+5, NES_RED);
+        for(int i = 1; i < 8; i++) spx(x+i, y-1, NES_RED);
+        
+        // Shirt
+        for(int j = 7; j <= 11; j++) {
+            for(int i = 2; i < 7; i++) spx(x+i, y+j, NES_BLUE);
+        }
+        
+        // Arms
+        int armOffset = (f < 2) ? 0 : 1;
+        spx(x+1, y+7+armOffset, NES_SKIN); spx(x+1, y+8+armOffset, NES_SKIN);
+        spx(x+1, y+9+armOffset, NES_SKIN);
+        spx(x+7, y+7+(1-armOffset), NES_SKIN); spx(x+7, y+8+(1-armOffset), NES_SKIN);
+        spx(x+7, y+9+(1-armOffset), NES_SKIN);
+        
+        // Pants
+        for(int j = 12; j <= 14; j++) {
+            for(int i = 2; i < 7; i++) spx(x+i, y+j, NES_DKGRAY);
+        }
+        
+        // Legs
+        int legL = 0, legR = 0;
+        switch(f) {
+            case 0: legL = 0; legR = 2; break;
+            case 1: legL = 1; legR = 1; break;
+            case 2: legL = 2; legR = 0; break;
+            case 3: legL = 1; legR = 1; break;
+        }
+        spx(x+2+legL, y+15, NES_DKGRAY); spx(x+2+legL, y+16, NES_DKGRAY);
+        spx(x+2+legL, y+17, NES_BROWN); spx(x+3+legL, y+17, NES_BROWN);
+        spx(x+5-legR, y+15, NES_DKGRAY); spx(x+5-legR, y+16, NES_DKGRAY);
+        spx(x+5-legR, y+17, NES_BROWN); spx(x+6-legR, y+17, NES_BROWN);
+    }
+    
+    static void drawNote8bitSprite(int x, int y, uint16_t color) {
+        spx(x, y+2, color); spx(x+1, y+2, color);
+        spx(x, y+3, color); spx(x+1, y+3, color);
+        spx(x+1, y, color); spx(x+1, y+1, color);
+        spx(x+2, y, color); spx(x+2, y+1, color);
+    }
+    
+    static void drawDoubleNote8bitSprite(int x, int y, uint16_t color) {
+        spx(x, y+2, color); spx(x+1, y+2, color);
+        spx(x+3, y+2, color); spx(x+4, y+2, color);
+        spx(x+1, y, color); spx(x+1, y+1, color);
+        spx(x+4, y, color); spx(x+4, y+1, color);
+        spx(x+1, y, color); spx(x+2, y, color); spx(x+3, y, color); spx(x+4, y, color);
+    }
+    
+    static void drawHouse8bitSprite(int hx, int hy) {
+        for(int i = 0; i < 8; i++) {
+            for(int j = 8-i; j <= 8+i; j++) {
+                spx(hx+j, hy+i, NES_RED);
+            }
+        }
+        for(int j = 8; j < 16; j++) {
+            for(int i = 1; i < 16; i++) {
+                spx(hx+i, hy+j, NES_GRAY);
+            }
+        }
+        for(int j = 10; j < 16; j++) {
+            spx(hx+7, hy+j, NES_BROWN); spx(hx+8, hy+j, NES_BROWN); spx(hx+9, hy+j, NES_BROWN);
+        }
+        spx(hx+9, hy+13, NES_YELLOW);
+        spx(hx+3, hy+10, NES_CYAN); spx(hx+4, hy+10, NES_CYAN);
+        spx(hx+3, hy+11, NES_CYAN); spx(hx+4, hy+11, NES_CYAN);
+        spx(hx+12, hy+10, NES_CYAN); spx(hx+13, hy+10, NES_CYAN);
+        spx(hx+12, hy+11, NES_CYAN); spx(hx+13, hy+11, NES_CYAN);
+        spx(hx+12, hy+2, NES_BROWN); spx(hx+13, hy+2, NES_BROWN);
+        spx(hx+12, hy+3, NES_BROWN); spx(hx+13, hy+3, NES_BROWN);
+        spx(hx+12, hy+4, NES_BROWN); spx(hx+13, hy+4, NES_BROWN);
+    }
+    
+    static void drawTree8bitSprite(int tx, int ty) {
+        spx(tx+2, ty+6, NES_BROWN); spx(tx+3, ty+6, NES_BROWN);
+        spx(tx+2, ty+7, NES_BROWN); spx(tx+3, ty+7, NES_BROWN);
+        spx(tx+2, ty+8, NES_BROWN); spx(tx+3, ty+8, NES_BROWN);
+        for(int i = 0; i < 6; i++) spx(tx+i, ty+5, NES_GREEN);
+        for(int i = 0; i < 6; i++) spx(tx+i, ty+4, NES_GREEN);
+        for(int i = 1; i < 5; i++) spx(tx+i, ty+3, NES_GREEN);
+        for(int i = 1; i < 5; i++) spx(tx+i, ty+2, NES_DKGREEN);
+        spx(tx+2, ty+1, NES_DKGREEN); spx(tx+3, ty+1, NES_DKGREEN);
+        spx(tx+2, ty, NES_GREEN); spx(tx+3, ty, NES_GREEN);
+    }
+    
+    static void drawCloud8bitSprite(int cx, int cy) {
+        for(int i = 1; i < 6; i++) spx(cx+i, cy, NES_WHITE);
+        for(int i = 0; i < 7; i++) spx(cx+i, cy+1, NES_WHITE);
+        for(int i = 1; i < 6; i++) spx(cx+i, cy+2, NES_WHITE);
+    }
+    
+    static void drawSun8bitSprite(int sx, int sy, int frame) {
+        for(int j = 0; j < 4; j++) {
+            for(int i = 0; i < 4; i++) {
+                spx(sx+i, sy+j, NES_YELLOW);
+            }
+        }
+        int rayPhase = (frame / 5) % 2;
+        if(rayPhase == 0) {
+            spx(sx+1, sy-1, NES_YELLOW); spx(sx+2, sy-1, NES_YELLOW);
+            spx(sx-1, sy+1, NES_YELLOW); spx(sx+4, sy+1, NES_YELLOW);
+            spx(sx-1, sy+2, NES_YELLOW); spx(sx+4, sy+2, NES_YELLOW);
+            spx(sx+1, sy+4, NES_YELLOW); spx(sx+2, sy+4, NES_YELLOW);
+        } else {
+            spx(sx-1, sy-1, NES_ORANGE); spx(sx+4, sy-1, NES_ORANGE);
+            spx(sx+1, sy-1, NES_YELLOW); spx(sx+2, sy-1, NES_YELLOW);
+            spx(sx-1, sy+4, NES_ORANGE); spx(sx+4, sy+4, NES_ORANGE);
+            spx(sx+1, sy+4, NES_YELLOW); spx(sx+2, sy+4, NES_YELLOW);
+        }
+    }
+    
+    static void drawGround8bitSprite() {
+        int groundY = 52;
+        for(int y = groundY; y < groundY + 5; y++) {
+            for(int x = 0; x < 120; x++) {
+                spx(x, y, NES_GREEN);
+            }
+        }
+        for(int x = 0; x < 120; x += 5) {
+            spx(x, groundY, NES_DKGREEN);
+            spx(x+2, groundY, NES_DKGREEN);
+        }
+        for(int y = groundY + 5; y < 68; y++) {
+            for(int x = 0; x < 120; x++) {
+                spx(x, y, NES_DKGRAY);
+            }
+        }
+        for(int x = 0; x < 120; x += 10) {
+            for(int i = 0; i < 5; i++) {
+                spx(x+i, groundY + 8, NES_YELLOW);
+            }
+        }
+    }
+    
+    static void show() {
+        // Create full-screen sprite for double buffering (no flicker)
+        LGFX_Sprite frameBuffer(&M5Cardputer.Display);
+        frameBuffer.setColorDepth(16);
+        frameBuffer.createSprite(240, 135);
+        splashSprite = &frameBuffer;
+        
+        // Animation variables
+        int boyX = 35;  // Fixed position - boy does not move
+        int boyY = 32;
+        
+        // Note tracking
+        struct Note8 {
+            int x, y;
+            int type;
+            uint16_t color;
+            int floatY;
+            bool active;
+        };
+        Note8 notes[3] = {{0,0,0,0,0,false},{0,0,0,0,0,false},{0,0,0,0,0,false}};
+        uint16_t noteColors[] = {NES_CYAN, NES_MAGENTA, NES_YELLOW, NES_RED};
+        
+        // Main animation loop - 60 frames
+        for(int frame = 0; frame < 60; frame++) {
+            // Clear entire frame buffer with sky color
+            frameBuffer.fillScreen(NES_SKY);
+            
+            // Draw all static elements to buffer
+            drawGround8bitSprite();
+            drawSun8bitSprite(100, 5, frame);
+            drawCloud8bitSprite(10, 8);
+            drawCloud8bitSprite(60, 12);
+            drawTree8bitSprite(5, 40);
+            drawTree8bitSprite(70, 42);
+            drawHouse8bitSprite(85, 30);
+            
+            // Draw the walking boy (stationary position, only animates walk cycle)
+            drawBoy8bitSprite(boyX, boyY, frame);
+            
+            // Spawn new note every 12 frames
+            if(frame % 12 == 0) {
+                for(int n = 0; n < 3; n++) {
+                    if(!notes[n].active) {
+                        notes[n].x = boyX + 8;
+                        notes[n].y = boyY - 2;
+                        notes[n].type = random(0, 2);
+                        notes[n].color = noteColors[random(0, 4)];
+                        notes[n].floatY = 0;
+                        notes[n].active = true;
+                        break;
+                    }
+                }
+            }
+            
+            // Update and draw notes
+            for(int n = 0; n < 3; n++) {
+                if(notes[n].active) {
+                    int noteDrawX = notes[n].x + ((notes[n].floatY / 3) % 3) - 1;
+                    int noteDrawY = notes[n].y - notes[n].floatY;
+                    
+                    if(noteDrawY > 5 && noteDrawY < 50) {
+                        if(notes[n].type == 0) {
+                            drawNote8bitSprite(noteDrawX, noteDrawY, notes[n].color);
+                        } else {
+                            drawDoubleNote8bitSprite(noteDrawX, noteDrawY, notes[n].color);
+                        }
+                    }
+                    
+                    notes[n].floatY += 1;
+                    if(notes[n].floatY > 25) {
+                        notes[n].active = false;
+                    }
+                }
+            }
+            
+            // Title bar
+            frameBuffer.fillRect(0, 0, 240, 22, NES_BLACK);
+            uint16_t colors[] = {NES_CYAN, NES_WHITE, NES_YELLOW, NES_MAGENTA};
+            uint16_t titleColor = colors[(frame / 10) % 4];
+            frameBuffer.setFont(&fonts::Font0);
+            frameBuffer.setTextColor(titleColor);
+            frameBuffer.setCursor(45, 7);
+            frameBuffer.print("SAM MUSIC PLAYER");
+            spx(10, 3, NES_CYAN); spx(11, 4, NES_MAGENTA); spx(10, 5, NES_YELLOW);
+            spx(108, 3, NES_CYAN); spx(109, 4, NES_MAGENTA); spx(108, 5, NES_YELLOW);
+            
+            // Loading bar
+            frameBuffer.fillRect(75, 118, 90, 16, NES_BLACK);
+            int barW = 80;
+            int progress = (frame * barW) / 60;
+            frameBuffer.drawRect(80, 118, barW, 4, NES_WHITE);
+            if(progress > 2) frameBuffer.fillRect(81, 119, progress - 2, 2, NES_CYAN);
+            
+            frameBuffer.setTextColor(NES_WHITE);
+            frameBuffer.setCursor(80, 124);
+            frameBuffer.print("LOADING");
+            int dots = (frame / 8) % 4;
+            for(int d = 0; d < dots; d++) frameBuffer.print(".");
+            
+            // Press any key hint (blinking)
+            if((frame / 15) % 2 == 0) {
+                frameBuffer.setTextColor(NES_DKGRAY);
+                frameBuffer.setCursor(50, 108);
+                frameBuffer.print("PRESS ANY KEY...");
+            }
+            
+            // Push entire frame to display at once (no flicker!)
+            frameBuffer.pushSprite(0, 0);
+            
+            delay(50);
+            
+            // Check for key press
+            M5Cardputer.update();
+            if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+                frameBuffer.deleteSprite();
+                if(!BootMenu::show()) {
+                    return;
+                }
+                // Recreate sprite and continue
+                frameBuffer.createSprite(240, 135);
+                splashSprite = &frameBuffer;
+            }
+        }
+        
+        // Delete sprite buffer
+        frameBuffer.deleteSprite();
+        
+        // End animation - flash effect (NES style)
+        for(int i = 0; i < 3; i++) {
+            M5Cardputer.Display.fillScreen(NES_WHITE);
+            delay(50);
+            M5Cardputer.Display.fillScreen(NES_BLACK);
+            delay(50);
+        }
+        
+        M5Cardputer.Display.setBrightness(userSettings.brightness);
+    }
+};
+
+// Static member definition
+LGFX_Sprite* SplashScreen::splashSprite = nullptr;
+
+// ==========================================
 // MAIN SETUP & LOOP
 // ==========================================
 void setup() {
@@ -1042,7 +2033,6 @@ void setup() {
     auto spk_cfg = M5Cardputer.Speaker.config(); spk_cfg.sample_rate = sampleRateValues[userSettings.spkRateIndex];
     spk_cfg.task_pinned_core = APP_CPU_NUM; spk_cfg.dma_buf_count = 8; spk_cfg.dma_buf_len = 256; spk_cfg.task_priority = 3;    
     M5Cardputer.Speaker.config(spk_cfg);
-    out = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
 
     M5Cardputer.Display.setRotation(1); visSprite.setColorDepth(16); 
     visSprite.createSprite(M5Cardputer.Display.width() - PLAYLIST_WIDTH - 2, M5Cardputer.Display.height() - HEADER_HEIGHT - 55 - BOTTOM_BAR_HEIGHT);
@@ -1052,11 +2042,22 @@ void setup() {
 
     WebServerManager::setup();
     M5Cardputer.Display.setBrightness(userSettings.brightness);
+
+    // Show splash screen animation
+    SplashScreen::show();
     
+    out = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
+    out->begin();
+
+    // Restore g_activePlaylist from saved currentFolder
+    g_activePlaylist = getPlaylistPath(userSettings.currentFolder);
+
     if (audioApp.loadPlaylist()) {
-        if (userSettings.resumePlay && userSettings.lastIndex < audioApp.songOffsets.size()) audioApp.play(userSettings.lastIndex, userSettings.lastPos); 
+        if (userSettings.resumePlay && userSettings.lastIndex < (int)audioApp.songOffsets.size())
+            audioApp.play(userSettings.lastIndex, userSettings.lastPos); 
         else audioApp.play(0);
     } else {
+        // Cache missing — fall back to full scan
         audioApp.performFullScan(); 
         if(audioApp.songOffsets.size() > 0) audioApp.play(0);
     }
@@ -1069,10 +2070,10 @@ void loop() {
     static int lastPlayingIndex = -1;
     if (lastPlayingIndex != audioApp.currentIndex && currentState == UI_PLAYER && !isScreenOff) {
         lastPlayingIndex = audioApp.currentIndex;
-        UIManager::drawHeader();       // Updates the [1/50] song counter
-        UIManager::drawPlaylist();     // Moves the > cursor
-        UIManager::drawNowPlaying();   // Updates the track name & cover area
-        UIManager::drawBottomBar();    // Updates the MP3/FLAC badge!
+        UIManager::drawHeader();
+        UIManager::drawPlaylist();
+        UIManager::drawNowPlaying();
+        UIManager::drawBottomBar();
     }
     if (currentState == UI_PLAYER && !isScreenOff) {
         static unsigned long lastVis = 0; if (millis() - lastVis > 30) { UIManager::drawVisualizer(); lastVis = millis(); }
@@ -1107,13 +2108,17 @@ void loop() {
                         audioApp.play(audioApp.browserIndex); 
                     } else {
                         audioApp.togglePause();
-                        UIManager::drawNowPlaying(); // Only redraws to show [ PAUSED ]
+                        UIManager::drawNowPlaying();
                     }
                     ConfigManager::save(audioApp.id3 ? audioApp.id3->getPos() : 0, audioApp.currentIndex);
                 }
                 else if (M5Cardputer.Keyboard.isKeyPressed('n')) { audioApp.next(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed('b')) { audioApp.prev(); }
-                else if (M5Cardputer.Keyboard.isKeyPressed('s')) { audioApp.isShuffle = !audioApp.isShuffle; UIManager::drawNowPlaying(); }
+                else if (M5Cardputer.Keyboard.isKeyPressed('s')) {
+                    g_searchQuery = ""; g_searchResults.clear(); g_searchCursor = 0; g_searchScrollOffset = 0;
+                    currentState = UI_SEARCH; UIManager::drawSearch();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('f')) { audioApp.isShuffle = !audioApp.isShuffle; UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed('l')) { audioApp.loopMode = (LoopState)((audioApp.loopMode + 1) % 3); UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed('v')) { 
                     userSettings.visMode = (userSettings.visMode + 1) % NUM_VIS_MODES;
@@ -1130,7 +2135,7 @@ void loop() {
                 else if (M5Cardputer.Keyboard.isKeyPressed(';')) { 
                     UIManager::settingsCursor = (UIManager::settingsCursor - 1 + numSettings) % numSettings;
                     if (UIManager::settingsCursor < UIManager::menuScrollOffset) UIManager::menuScrollOffset = UIManager::settingsCursor;
-                    else if (UIManager::settingsCursor == 11) UIManager::menuScrollOffset = 8;
+                    else if (UIManager::settingsCursor == (numSettings - 1)) UIManager::menuScrollOffset = (numSettings-4);
                     UIManager::drawSettings(); 
                 }
                 else if (M5Cardputer.Keyboard.isKeyPressed('.')) { 
@@ -1151,12 +2156,12 @@ void loop() {
                         case 5: userSettings.wifiEnabled = !userSettings.wifiEnabled; break;
                         case 6: userSettings.isAPMode = !userSettings.isAPMode; break;
                         case 7: userSettings.powerSaverMode = (userSettings.powerSaverMode + (right?1:-1) + 3) % 3; applyCpuFrequency(); break;
-                        case 8: // --- THEME SWITCHER ---
+                        case 8:
                             userSettings.themeIndex = (userSettings.themeIndex + (right?1:-1) + NUM_THEMES) % NUM_THEMES;
                             applyTheme(userSettings.themeIndex);
-                            UIManager::drawBaseUI(); // Redraw background instantly to show off new colors
+                            UIManager::drawBaseUI();
                             break;
-                        case 9: // --- VISUALIZER TOGGLE ---
+                        case 9:
                             userSettings.visMode = (userSettings.visMode + (right?1:-1) + NUM_VIS_MODES) % NUM_VIS_MODES;
                             UIManager::drawBaseUI(); 
                             break;
@@ -1175,6 +2180,11 @@ void loop() {
                         case 12: audioApp.performFullScan(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
                         case 13: ConfigManager::exportToSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
                         case 14: ConfigManager::importFromSD(); currentState = UI_PLAYER; UIManager::drawBaseUI(); break;
+                        case 15: // Playlist / Folder Selector
+                            UIManager::buildFolderList();
+                            currentState = UI_FOLDER_SELECT;
+                            UIManager::drawFolderSelect();
+                            break;
                     }
                 }
                 break;
@@ -1216,6 +2226,7 @@ void loop() {
                 break;
 
             case UI_TEXT_INPUT:
+                {
                 auto status = M5Cardputer.Keyboard.keysState(); bool redraw = false;
                 if (status.del && enteredText.length() > 0) { enteredText.remove(enteredText.length() - 1); redraw = true; } 
                 else if (status.enter) {
@@ -1229,6 +2240,109 @@ void loop() {
                 else if (M5Cardputer.Keyboard.isKeyPressed('`')) { currentState = UI_SETTINGS; UIManager::drawSettings(); } 
                 else { for (char c : status.word) { enteredText += c; redraw = true; } }
                 if (redraw) UIManager::drawTextInput();
+                }
+                break;
+
+            // --------------------------------------------------
+            // SEARCH STATE
+            // --------------------------------------------------
+            case UI_SEARCH:
+                {
+                auto status = M5Cardputer.Keyboard.keysState(); bool redraw = false;
+                if (M5Cardputer.Keyboard.isKeyPressed('`')) {
+                    currentState = UI_PLAYER; UIManager::drawBaseUI();
+                } else if (status.del && g_searchQuery.length() > 0) {
+                    g_searchQuery.remove(g_searchQuery.length() - 1);
+                    UIManager::rebuildSearchResults(); redraw = true;
+                } else if (M5Cardputer.Keyboard.isKeyPressed(';')) {
+                    if (g_searchResults.size() > 0) {
+                        g_searchCursor--;
+                        if (g_searchCursor < 0) g_searchCursor = (int)g_searchResults.size() - 1;
+                        if (g_searchCursor < g_searchScrollOffset) g_searchScrollOffset = g_searchCursor;
+                        if (g_searchCursor == (int)g_searchResults.size() - 1)
+                            g_searchScrollOffset = max(0, (int)g_searchResults.size() - MAX_VISIBLE_ROWS);
+                    }
+                    redraw = true;
+                } else if (M5Cardputer.Keyboard.isKeyPressed('.')) {
+                    if (g_searchResults.size() > 0) {
+                        g_searchCursor++;
+                        if (g_searchCursor >= (int)g_searchResults.size()) { g_searchCursor = 0; g_searchScrollOffset = 0; }
+                        if (g_searchCursor >= g_searchScrollOffset + MAX_VISIBLE_ROWS) g_searchScrollOffset++;
+                    }
+                    redraw = true;
+                } else if (status.enter) {
+                    if (g_searchResults.size() > 0) {
+                        int songIdx = g_searchResults[g_searchCursor];
+                        audioApp.play(songIdx);
+                        currentState = UI_PLAYER;
+                        UIManager::drawBaseUI();
+                    }
+                } else {
+                    for (char c : status.word) {
+                        g_searchQuery += c; redraw = true;
+                    }
+                    if (redraw) UIManager::rebuildSearchResults();
+                }
+                if (redraw && currentState == UI_SEARCH) UIManager::drawSearch();
+                }
+                break;
+
+            // --------------------------------------------------
+            // FOLDER SELECT STATE
+            // --------------------------------------------------
+            case UI_FOLDER_SELECT:
+                if (M5Cardputer.Keyboard.isKeyPressed('`')) {
+                    // Back to settings without changing playlist
+                    currentState = UI_SETTINGS;
+                    UIManager::drawSettings();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed(';')) {
+                    // Scroll up
+                    UIManager::folderCursor--;
+                    if (UIManager::folderCursor < 0) UIManager::folderCursor = (int)UIManager::folderList.size() - 1;
+                    if (UIManager::folderCursor < UIManager::folderScrollOffset)
+                        UIManager::folderScrollOffset = UIManager::folderCursor;
+                    if (UIManager::folderCursor == (int)UIManager::folderList.size() - 1)
+                        UIManager::folderScrollOffset = max(0, (int)UIManager::folderList.size() - MAX_VISIBLE_ROWS);
+                    UIManager::drawFolderSelect();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('.')) {
+                    // Scroll down
+                    UIManager::folderCursor++;
+                    if (UIManager::folderCursor >= (int)UIManager::folderList.size()) { UIManager::folderCursor = 0; UIManager::folderScrollOffset = 0; }
+                    if (UIManager::folderCursor >= UIManager::folderScrollOffset + MAX_VISIBLE_ROWS)
+                        UIManager::folderScrollOffset++;
+                    UIManager::drawFolderSelect();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('r')) {
+                    // Force-rescan selected folder (delete cache first)
+                    String selectedFolder = UIManager::folderList[UIManager::folderCursor];
+                    String cachePath = getPlaylistPath(selectedFolder);
+                    if (SD.exists(cachePath)) SD.remove(cachePath);
+                    audioApp.performFolderScan(selectedFolder == "" ? "/" : selectedFolder);
+                    ConfigManager::save();
+                    // Rebuild folder list to refresh cache indicators
+                    UIManager::buildFolderList();
+                    UIManager::drawFolderSelect();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
+                    // Load selected folder's playlist
+                    String selectedFolder = UIManager::folderList[UIManager::folderCursor];
+                    bool ok = audioApp.loadPlaylistForFolder(selectedFolder);
+                    ConfigManager::save();
+                    currentState = UI_PLAYER;
+                    if (ok && audioApp.songOffsets.size() > 0) {
+                        audioApp.play(0);
+                    } else {
+                        // Empty or failed — show brief message
+                        M5Cardputer.Display.fillScreen(C_BG_DARK);
+                        M5Cardputer.Display.setCursor(10, 40);
+                        M5Cardputer.Display.setTextColor(TFT_RED);
+                        M5Cardputer.Display.print("No songs found!");
+                        delay(1500);
+                    }
+                    UIManager::drawBaseUI();
+                }
                 break;
         }
     }
