@@ -22,6 +22,49 @@
 #include <AudioGeneratorAAC.h>
 #include <AudioGeneratorWAV.h>
 #include <AudioFileSourceBuffer.h>
+#include "splash_screen.h"
+
+// ==========================================
+// PRE-DEFINE layout constants needed by
+// showStatusLog() and usb_audio.h before
+// the main constants block below
+// ==========================================
+#ifndef HEADER_HEIGHT
+#define HEADER_HEIGHT      20
+#endif
+#ifndef BOTTOM_BAR_HEIGHT
+#define BOTTOM_BAR_HEIGHT  18
+#endif
+
+// Forward declaration – C_HEADER is defined in the constants block below
+// but showStatusLog() only runs at runtime (after applyTheme sets it)
+extern uint16_t C_HEADER;
+
+// ==========================================
+// STATUS LOG – shown on bottom bar
+// Replaces Serial.println for USB events
+// ==========================================
+static char g_lastLogMsg[48] = "";
+static unsigned long g_lastLogTime = 0;
+static bool g_loggingEnabled = false; // synced with userSettings after load
+
+void showStatusLog(const char* msg) {
+    Serial.println(msg); // always send to serial
+    if (!g_loggingEnabled) return;
+    strncpy(g_lastLogMsg, msg, sizeof(g_lastLogMsg) - 1);
+    g_lastLogMsg[sizeof(g_lastLogMsg) - 1] = '\0';
+    g_lastLogTime = millis();
+    // Draw immediately on bottom bar
+    int yPos = M5Cardputer.Display.height() - BOTTOM_BAR_HEIGHT;
+    M5Cardputer.Display.fillRect(0, yPos, M5Cardputer.Display.width(), BOTTOM_BAR_HEIGHT, C_HEADER);
+    M5Cardputer.Display.setFont(&fonts::Font0);
+    M5Cardputer.Display.setTextColor(0x07E0, C_HEADER); // green text
+    M5Cardputer.Display.setCursor(3, yPos + 4);
+    M5Cardputer.Display.print(msg);
+}
+
+#include "usb_audio.h"
+
 // ==========================================
 // CONSTANTS & CONFIG
 // ==========================================
@@ -34,8 +77,7 @@
 
 #define PLAYLIST_WIDTH 120
 #define ROW_HEIGHT 15
-#define HEADER_HEIGHT 20
-#define BOTTOM_BAR_HEIGHT 18
+// HEADER_HEIGHT and BOTTOM_BAR_HEIGHT already defined above for showStatusLog
 #define MAX_VISIBLE_ROWS 6  
 
 // --- DYNAMIC COLORS & THEMES ---
@@ -110,7 +152,7 @@ const char* helpLines[] = {
   "Share your suggestions!"
 };
 const int numHelpLines = 28;
-const int numSettings = 16;   // +1 for Playlist Mode
+const int numSettings = 18;   // +1 for Logging toggle
 
 // ==========================================
 // GLOBALS
@@ -133,6 +175,8 @@ struct Settings {
     int powerSaverMode = 0;        
     int seek = 0;
     String currentFolder = "";    // "" = All Music; "/FolderName" = specific folder
+    int audioOutputMode = 0;      // 0=I2S (speaker), 1=USB (headphones)
+    bool loggingEnabled = false;  // Show USB/system log on bottom bar
 };
 
 Settings userSettings;
@@ -215,7 +259,8 @@ class AudioOutputM5Speaker : public AudioOutput {
     int16_t _tri_buffer[3][tri_buf_size]; size_t _tri_buffer_index = 0; size_t _tri_index = 0;
 };
 
-AudioOutputM5Speaker *out = nullptr;
+AudioOutput *out = nullptr;
+bool outIsI2S = true;  // true = AudioOutputM5Speaker, false = AudioOutputUSB
 static constexpr size_t WAVE_SIZE = 320;
 static fft_t fft;
 static int16_t raw_data[WAVE_SIZE * 2];
@@ -244,6 +289,9 @@ public:
         userSettings.visMode = preferences.getInt("visMode", 0);
         userSettings.seek = preferences.getInt("seek", 5);
         userSettings.currentFolder = preferences.getString("curFolder", "");
+        userSettings.audioOutputMode = preferences.getInt("audioOut", 0);
+        userSettings.loggingEnabled  = preferences.getBool("logging", false);
+        g_loggingEnabled             = userSettings.loggingEnabled;
         preferences.end();
         
         if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
@@ -270,6 +318,8 @@ public:
         preferences.putInt("visMode", userSettings.visMode);
         preferences.putInt("seek", userSettings.seek);
         preferences.putString("curFolder", userSettings.currentFolder);
+        preferences.putInt("audioOut", userSettings.audioOutputMode);
+        preferences.putBool("logging", userSettings.loggingEnabled);
         preferences.end();
     }
 
@@ -621,7 +671,7 @@ public:
             M5Cardputer.Display.setCursor(6, yPos);
             M5Cardputer.Display.print("No results.");
         } else {
-            for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
+            for (int i = 0; i < (MAX_VISIBLE_ROWS-1); i++) {
                 int ri = g_searchScrollOffset + i;
                 if (ri >= totalResults) break;
                 int songIdx = g_searchResults[ri];
@@ -653,7 +703,7 @@ public:
             M5Cardputer.Display.setTextColor(C_ACCENT);
             if (g_searchScrollOffset > 0)
                 M5Cardputer.Display.drawString("^", M5Cardputer.Display.width() - 10, boxY + 22);
-            if (g_searchScrollOffset + MAX_VISIBLE_ROWS < totalResults)
+            if (g_searchScrollOffset + MAX_VISIBLE_ROWS - 1 < totalResults)
                 M5Cardputer.Display.drawString("v", M5Cardputer.Display.width() - 10, boxY + 20 + (MAX_VISIBLE_ROWS * ROW_HEIGHT) - 6);
         }
 
@@ -706,7 +756,11 @@ public:
         } else M5Cardputer.Display.setTextColor(C_TEXT_MAIN, C_HEADER);
         
         String headerText = prefix + " [" + String(audioApp.currentIndex + 1) + "/" + String(audioApp.songOffsets.size()) + "]";
-        M5Cardputer.Display.drawString(headerText.c_str(), 5, 5); 
+        M5Cardputer.Display.drawString(headerText.c_str(), 5, 5);
+        
+        // USB Headphone icon – always visible (green=active, yellow=ready, gray=none, ?=no host)
+        USBAudioManager::drawHeaderIcon(M5Cardputer.Display.width() - 62, 2);
+        
         drawBattery();
     }
 
@@ -802,11 +856,29 @@ public:
         int volY = yStart + 42; M5Cardputer.Display.setCursor(xStart + 5, volY); M5Cardputer.Display.setFont(&fonts::Font0);
         M5Cardputer.Display.setTextColor(C_ACCENT); M5Cardputer.Display.print("VOL "); M5Cardputer.Display.drawRect(xStart + 30, volY, 60, 6, C_BG_LIGHT);
         M5Cardputer.Display.fillRect(xStart + 31, volY + 1, (M5Cardputer.Speaker.getVolume() * 58) / 255, 4, C_ACCENT);
+
+        // USB headphone status badge
+        int badgeX = xStart + 95;
+        int badgeY = volY - 1;
+        M5Cardputer.Display.fillRect(badgeX, badgeY, 44, 10, C_BG_DARK);
+        M5Cardputer.Display.setFont(&fonts::Font0);
+        uint16_t bColor = USBAudioManager::badgeColor();
+        const char* bText = USBAudioManager::badgeText();
+        if (USBAudioManager::badgeFilled()) {
+            M5Cardputer.Display.fillRoundRect(badgeX, badgeY, 44, 10, 2, bColor);
+            M5Cardputer.Display.setTextColor(TFT_BLACK);
+        } else {
+            M5Cardputer.Display.drawRoundRect(badgeX, badgeY, 44, 10, 2, bColor);
+            M5Cardputer.Display.setTextColor(bColor);
+        }
+        int bTextW = M5Cardputer.Display.textWidth(bText);
+        M5Cardputer.Display.setCursor(badgeX + (44 - bTextW) / 2, badgeY + 1);
+        M5Cardputer.Display.print(bText);
     }
 
     static void drawVisualizer() {
         if (!audioApp.decoder || !audioApp.decoder->isRunning() || audioApp.isPaused || !showVisualizer) return;
-        auto buf = out->getBuffer();
+        const int16_t* buf = outIsI2S ? static_cast<AudioOutputM5Speaker*>(out)->getBuffer() : nullptr;
         
         if (buf) {
             if (userSettings.visMode == 3) {
@@ -947,6 +1019,19 @@ public:
                     if (flabel.length() > 12) flabel = flabel.substring(0, 12) + "~";
                     M5Cardputer.Display.printf("Playlist: %s", flabel.c_str()); break;
                 }
+                case 16: {
+                    const char* outLabel = (userSettings.audioOutputMode == 1) ? "USB Headphones" : "I2S Speaker";
+                    uint16_t outColor = (userSettings.audioOutputMode == 1)
+                        ? (USBAudioManager::isConnected ? C_PLAYING : TFT_YELLOW)
+                        : C_TEXT_MAIN;
+                    M5Cardputer.Display.setTextColor(idx == settingsCursor ? C_HIGHLIGHT : outColor);
+                    M5Cardputer.Display.printf("Audio Out: %s", outLabel);
+                    break;
+                }
+                case 17:
+                    M5Cardputer.Display.printf("USB Logging: %s",
+                        userSettings.loggingEnabled ? "ON" : "OFF");
+                    break;
             }
         }
     }
@@ -1450,577 +1535,8 @@ sdcard_type_t BootMenu::sdCardType = CARD_NONE;
 uint32_t BootMenu::sdSectorCount = 0;
 uint32_t BootMenu::sdSectorSize = 512;
 
-// ==========================================
-// SPLASH SCREEN ANIMATION - 8-BIT NES STYLE
-// ==========================================
-class SplashScreen {
-public:
-    // NES-style color palette (limited colors like real NES)
-    static const uint16_t NES_BLACK = 0x0000;
-    static const uint16_t NES_WHITE = 0xFFFF;
-    static const uint16_t NES_SKY = 0x5DBF;      // Light blue sky
-    static const uint16_t NES_SKIN = 0xFCC0;     // Peach skin
-    static const uint16_t NES_BROWN = 0x8200;    // Brown
-    static const uint16_t NES_RED = 0xF800;      // Bright red
-    static const uint16_t NES_BLUE = 0x001F;     // Blue
-    static const uint16_t NES_GREEN = 0x07C0;    // Green
-    static const uint16_t NES_DKGREEN = 0x03C0;  // Dark green
-    static const uint16_t NES_YELLOW = 0xFFE0;   // Yellow
-    static const uint16_t NES_ORANGE = 0xFC00;   // Orange
-    static const uint16_t NES_GRAY = 0x8410;     // Gray
-    static const uint16_t NES_DKGRAY = 0x4208;   // Dark gray
-    static const uint16_t NES_CYAN = 0x07FF;     // Cyan
-    static const uint16_t NES_MAGENTA = 0xF81F;  // Magenta
+// SplashScreen class is defined in splash_screen.h
     
-    // Pixel size for chunky 8-bit look (2x2 or 3x3 pixels)
-    static const int PX = 2;
-    
-    // Draw a single "big pixel" (NES style chunky pixel)
-    static void px(int x, int y, uint16_t c) {
-        M5Cardputer.Display.fillRect(x * PX, y * PX, PX, PX, c);
-    }
-    
-    // Draw 8-bit style character sprite (16x24 pixels, scaled)
-    // Frame 0 = standing/walk1, Frame 1 = walk2
-    static void drawBoy8bit(int x, int y, int frame) {
-        // Clear sprite area first
-        M5Cardputer.Display.fillRect(x * PX - PX, y * PX, 18 * PX, 26 * PX, NES_SKY);
-        
-        int f = frame % 4; // 4 frame walk cycle
-        
-        // Hair (dark brown) - row 0-2
-        for(int i = 2; i < 7; i++) px(x+i, y, NES_DKGRAY);
-        for(int i = 1; i < 8; i++) px(x+i, y+1, NES_DKGRAY);
-        for(int i = 1; i < 8; i++) px(x+i, y+2, NES_DKGRAY);
-        
-        // Face (skin color) - row 3-6
-        for(int i = 1; i < 8; i++) px(x+i, y+3, NES_SKIN);
-        // Eyes row
-        px(x+1, y+4, NES_SKIN); px(x+2, y+4, NES_BLACK); px(x+3, y+4, NES_SKIN);
-        px(x+4, y+4, NES_SKIN); px(x+5, y+4, NES_BLACK); px(x+6, y+4, NES_SKIN);
-        px(x+7, y+4, NES_SKIN);
-        // Below eyes
-        for(int i = 1; i < 8; i++) px(x+i, y+5, NES_SKIN);
-        // Mouth row - smile
-        px(x+1, y+6, NES_SKIN); px(x+2, y+6, NES_SKIN); px(x+3, y+6, NES_BLACK);
-        px(x+4, y+6, NES_BLACK); px(x+5, y+6, NES_SKIN); px(x+6, y+6, NES_SKIN);
-        px(x+7, y+6, NES_SKIN);
-        
-        // Headphones - RED ear cups
-        px(x, y+3, NES_RED); px(x, y+4, NES_RED); px(x, y+5, NES_RED);
-        px(x+8, y+3, NES_RED); px(x+8, y+4, NES_RED); px(x+8, y+5, NES_RED);
-        // Headphone band on top
-        for(int i = 1; i < 8; i++) px(x+i, y-1, NES_RED);
-        
-        // Body/Shirt (Blue) - row 7-11
-        for(int j = 7; j <= 11; j++) {
-            for(int i = 2; i < 7; i++) px(x+i, y+j, NES_BLUE);
-        }
-        
-        // Arms (skin) - animated swing
-        int armOffset = (f < 2) ? 0 : 1;
-        // Left arm
-        px(x+1, y+7+armOffset, NES_SKIN); px(x+1, y+8+armOffset, NES_SKIN);
-        px(x+1, y+9+armOffset, NES_SKIN);
-        // Right arm
-        px(x+7, y+7+(1-armOffset), NES_SKIN); px(x+7, y+8+(1-armOffset), NES_SKIN);
-        px(x+7, y+9+(1-armOffset), NES_SKIN);
-        
-        // Pants (dark gray) - row 12-14
-        for(int j = 12; j <= 14; j++) {
-            for(int i = 2; i < 7; i++) px(x+i, y+j, NES_DKGRAY);
-        }
-        
-        // Legs with walk animation
-        int legL = 0, legR = 0;
-        switch(f) {
-            case 0: legL = 0; legR = 2; break;  // Left back, right forward
-            case 1: legL = 1; legR = 1; break;  // Both center
-            case 2: legL = 2; legR = 0; break;  // Left forward, right back
-            case 3: legL = 1; legR = 1; break;  // Both center
-        }
-        // Left leg + shoe
-        px(x+2+legL, y+15, NES_DKGRAY); px(x+2+legL, y+16, NES_DKGRAY);
-        px(x+2+legL, y+17, NES_BROWN); px(x+3+legL, y+17, NES_BROWN); // shoe
-        // Right leg + shoe
-        px(x+5-legR, y+15, NES_DKGRAY); px(x+5-legR, y+16, NES_DKGRAY);
-        px(x+5-legR, y+17, NES_BROWN); px(x+6-legR, y+17, NES_BROWN); // shoe
-    }
-    
-    // 8-bit music note (simple pixelated)
-    static void drawNote8bit(int x, int y, uint16_t color) {
-        // Note head
-        px(x, y+2, color); px(x+1, y+2, color);
-        px(x, y+3, color); px(x+1, y+3, color);
-        // Stem
-        px(x+1, y, color); px(x+1, y+1, color);
-        // Flag
-        px(x+2, y, color); px(x+2, y+1, color);
-    }
-    
-    // 8-bit double note (beamed)
-    static void drawDoubleNote8bit(int x, int y, uint16_t color) {
-        // First note head
-        px(x, y+2, color); px(x+1, y+2, color);
-        // Second note head
-        px(x+3, y+2, color); px(x+4, y+2, color);
-        // Stems
-        px(x+1, y, color); px(x+1, y+1, color);
-        px(x+4, y, color); px(x+4, y+1, color);
-        // Beam
-        px(x+1, y, color); px(x+2, y, color); px(x+3, y, color); px(x+4, y, color);
-    }
-    
-    // 8-bit house
-    static void drawHouse8bit(int hx, int hy) {
-        // Roof (red/brown triangle approximation in pixels)
-        for(int i = 0; i < 8; i++) {
-            for(int j = 8-i; j <= 8+i; j++) {
-                px(hx+j, hy+i, NES_RED);
-            }
-        }
-        // Walls (gray)
-        for(int j = 8; j < 16; j++) {
-            for(int i = 1; i < 16; i++) {
-                px(hx+i, hy+j, NES_GRAY);
-            }
-        }
-        // Door (brown)
-        for(int j = 10; j < 16; j++) {
-            px(hx+7, hy+j, NES_BROWN); px(hx+8, hy+j, NES_BROWN); px(hx+9, hy+j, NES_BROWN);
-        }
-        // Door knob
-        px(hx+9, hy+13, NES_YELLOW);
-        // Windows (cyan with white cross)
-        px(hx+3, hy+10, NES_CYAN); px(hx+4, hy+10, NES_CYAN);
-        px(hx+3, hy+11, NES_CYAN); px(hx+4, hy+11, NES_CYAN);
-        px(hx+12, hy+10, NES_CYAN); px(hx+13, hy+10, NES_CYAN);
-        px(hx+12, hy+11, NES_CYAN); px(hx+13, hy+11, NES_CYAN);
-        // Chimney
-        px(hx+12, hy+2, NES_BROWN); px(hx+13, hy+2, NES_BROWN);
-        px(hx+12, hy+3, NES_BROWN); px(hx+13, hy+3, NES_BROWN);
-        px(hx+12, hy+4, NES_BROWN); px(hx+13, hy+4, NES_BROWN);
-    }
-    
-    // 8-bit tree
-    static void drawTree8bit(int tx, int ty) {
-        // Trunk (brown)
-        px(tx+2, ty+6, NES_BROWN); px(tx+3, ty+6, NES_BROWN);
-        px(tx+2, ty+7, NES_BROWN); px(tx+3, ty+7, NES_BROWN);
-        px(tx+2, ty+8, NES_BROWN); px(tx+3, ty+8, NES_BROWN);
-        // Leaves (green - triangle-ish)
-        for(int i = 0; i < 6; i++) px(tx+i, ty+5, NES_GREEN);
-        for(int i = 0; i < 6; i++) px(tx+i, ty+4, NES_GREEN);
-        for(int i = 1; i < 5; i++) px(tx+i, ty+3, NES_GREEN);
-        for(int i = 1; i < 5; i++) px(tx+i, ty+2, NES_DKGREEN);
-        px(tx+2, ty+1, NES_DKGREEN); px(tx+3, ty+1, NES_DKGREEN);
-        px(tx+2, ty, NES_GREEN); px(tx+3, ty, NES_GREEN);
-    }
-    
-    // 8-bit cloud
-    static void drawCloud8bit(int cx, int cy) {
-        // Simple blocky cloud
-        for(int i = 1; i < 6; i++) px(cx+i, cy, NES_WHITE);
-        for(int i = 0; i < 7; i++) px(cx+i, cy+1, NES_WHITE);
-        for(int i = 1; i < 6; i++) px(cx+i, cy+2, NES_WHITE);
-    }
-    
-    // 8-bit sun
-    static void drawSun8bit(int sx, int sy, int frame) {
-        // Sun body
-        for(int j = 0; j < 4; j++) {
-            for(int i = 0; i < 4; i++) {
-                px(sx+i, sy+j, NES_YELLOW);
-            }
-        }
-        // Animated rays (alternating pattern)
-        int rayPhase = (frame / 5) % 2;
-        if(rayPhase == 0) {
-            px(sx+1, sy-1, NES_YELLOW); px(sx+2, sy-1, NES_YELLOW);
-            px(sx-1, sy+1, NES_YELLOW); px(sx+4, sy+1, NES_YELLOW);
-            px(sx-1, sy+2, NES_YELLOW); px(sx+4, sy+2, NES_YELLOW);
-            px(sx+1, sy+4, NES_YELLOW); px(sx+2, sy+4, NES_YELLOW);
-        } else {
-            px(sx-1, sy-1, NES_ORANGE); px(sx+4, sy-1, NES_ORANGE);
-            px(sx+1, sy-1, NES_YELLOW); px(sx+2, sy-1, NES_YELLOW);
-            px(sx-1, sy+4, NES_ORANGE); px(sx+4, sy+4, NES_ORANGE);
-            px(sx+1, sy+4, NES_YELLOW); px(sx+2, sy+4, NES_YELLOW);
-        }
-    }
-    
-    // 8-bit ground with grass detail
-    static void drawGround8bit() {
-        // Grass layer
-        int groundY = 52;
-        for(int y = groundY; y < groundY + 5; y++) {
-            for(int x = 0; x < 120; x++) {
-                px(x, y, NES_GREEN);
-            }
-        }
-        // Grass detail (darker patches)
-        for(int x = 0; x < 120; x += 5) {
-            px(x, groundY, NES_DKGREEN);
-            px(x+2, groundY, NES_DKGREEN);
-        }
-        // Path/road
-        for(int y = groundY + 5; y < 68; y++) {
-            for(int x = 0; x < 120; x++) {
-                px(x, y, NES_DKGRAY);
-            }
-        }
-        // Road stripes (yellow dashes)
-        for(int x = 0; x < 120; x += 10) {
-            for(int i = 0; i < 5; i++) {
-                px(x+i, groundY + 8, NES_YELLOW);
-            }
-        }
-    }
-    
-    // Draw retro 8-bit title with pixel font effect
-    static void drawTitle8bit(int frame) {
-        // Title background bar
-        M5Cardputer.Display.fillRect(0, 0, 240, 22, NES_BLACK);
-        
-        // "SAM MUSIC PLAYER" - simple pixel text with color cycling
-        uint16_t colors[] = {NES_CYAN, NES_WHITE, NES_YELLOW, NES_MAGENTA};
-        uint16_t titleColor = colors[(frame / 10) % 4];
-        
-        M5Cardputer.Display.setFont(&fonts::Font0);
-        M5Cardputer.Display.setTextColor(titleColor);
-        M5Cardputer.Display.setCursor(45, 7);
-        M5Cardputer.Display.print("SAM MUSIC PLAYER");
-        
-        // Decorative pixels around title (NES style)
-        px(10, 3, NES_CYAN); px(11, 4, NES_MAGENTA); px(10, 5, NES_YELLOW);
-        px(108, 3, NES_CYAN); px(109, 4, NES_MAGENTA); px(108, 5, NES_YELLOW);
-    }
-    
-    // Draw "LOADING" with animated dots
-    static void drawLoading8bit(int frame) {
-        M5Cardputer.Display.fillRect(75, 122, 90, 12, NES_BLACK);
-        M5Cardputer.Display.setTextColor(NES_WHITE);
-        M5Cardputer.Display.setCursor(80, 124);
-        M5Cardputer.Display.print("LOADING");
-        
-        int dots = (frame / 8) % 4;
-        for(int d = 0; d < dots; d++) {
-            M5Cardputer.Display.print(".");
-        }
-        
-        // Animated loading bar (NES style)
-        int barX = 80;
-        int barY = 118;
-        int barW = 80;
-        int progress = (frame * barW) / 60;
-        if(progress > barW) progress = barW;
-        
-        M5Cardputer.Display.drawRect(barX, barY, barW, 4, NES_WHITE);
-        M5Cardputer.Display.fillRect(barX + 1, barY + 1, progress - 2, 2, NES_CYAN);
-    }
-    
-    // Sprite-based drawing functions for double buffering
-    static LGFX_Sprite* splashSprite;
-    
-    static void spx(int x, int y, uint16_t c) {
-        splashSprite->fillRect(x * PX, y * PX, PX, PX, c);
-    }
-    
-    static void drawBoy8bitSprite(int x, int y, int frame) {
-        int f = frame % 4;
-        
-        // Hair
-        for(int i = 2; i < 7; i++) spx(x+i, y, NES_DKGRAY);
-        for(int i = 1; i < 8; i++) spx(x+i, y+1, NES_DKGRAY);
-        for(int i = 1; i < 8; i++) spx(x+i, y+2, NES_DKGRAY);
-        
-        // Face
-        for(int i = 1; i < 8; i++) spx(x+i, y+3, NES_SKIN);
-        spx(x+1, y+4, NES_SKIN); spx(x+2, y+4, NES_BLACK); spx(x+3, y+4, NES_SKIN);
-        spx(x+4, y+4, NES_SKIN); spx(x+5, y+4, NES_BLACK); spx(x+6, y+4, NES_SKIN);
-        spx(x+7, y+4, NES_SKIN);
-        for(int i = 1; i < 8; i++) spx(x+i, y+5, NES_SKIN);
-        spx(x+1, y+6, NES_SKIN); spx(x+2, y+6, NES_SKIN); spx(x+3, y+6, NES_BLACK);
-        spx(x+4, y+6, NES_BLACK); spx(x+5, y+6, NES_SKIN); spx(x+6, y+6, NES_SKIN);
-        spx(x+7, y+6, NES_SKIN);
-        
-        // Headphones
-        spx(x, y+3, NES_RED); spx(x, y+4, NES_RED); spx(x, y+5, NES_RED);
-        spx(x+8, y+3, NES_RED); spx(x+8, y+4, NES_RED); spx(x+8, y+5, NES_RED);
-        for(int i = 1; i < 8; i++) spx(x+i, y-1, NES_RED);
-        
-        // Shirt
-        for(int j = 7; j <= 11; j++) {
-            for(int i = 2; i < 7; i++) spx(x+i, y+j, NES_BLUE);
-        }
-        
-        // Arms
-        int armOffset = (f < 2) ? 0 : 1;
-        spx(x+1, y+7+armOffset, NES_SKIN); spx(x+1, y+8+armOffset, NES_SKIN);
-        spx(x+1, y+9+armOffset, NES_SKIN);
-        spx(x+7, y+7+(1-armOffset), NES_SKIN); spx(x+7, y+8+(1-armOffset), NES_SKIN);
-        spx(x+7, y+9+(1-armOffset), NES_SKIN);
-        
-        // Pants
-        for(int j = 12; j <= 14; j++) {
-            for(int i = 2; i < 7; i++) spx(x+i, y+j, NES_DKGRAY);
-        }
-        
-        // Legs
-        int legL = 0, legR = 0;
-        switch(f) {
-            case 0: legL = 0; legR = 2; break;
-            case 1: legL = 1; legR = 1; break;
-            case 2: legL = 2; legR = 0; break;
-            case 3: legL = 1; legR = 1; break;
-        }
-        spx(x+2+legL, y+15, NES_DKGRAY); spx(x+2+legL, y+16, NES_DKGRAY);
-        spx(x+2+legL, y+17, NES_BROWN); spx(x+3+legL, y+17, NES_BROWN);
-        spx(x+5-legR, y+15, NES_DKGRAY); spx(x+5-legR, y+16, NES_DKGRAY);
-        spx(x+5-legR, y+17, NES_BROWN); spx(x+6-legR, y+17, NES_BROWN);
-    }
-    
-    static void drawNote8bitSprite(int x, int y, uint16_t color) {
-        spx(x, y+2, color); spx(x+1, y+2, color);
-        spx(x, y+3, color); spx(x+1, y+3, color);
-        spx(x+1, y, color); spx(x+1, y+1, color);
-        spx(x+2, y, color); spx(x+2, y+1, color);
-    }
-    
-    static void drawDoubleNote8bitSprite(int x, int y, uint16_t color) {
-        spx(x, y+2, color); spx(x+1, y+2, color);
-        spx(x+3, y+2, color); spx(x+4, y+2, color);
-        spx(x+1, y, color); spx(x+1, y+1, color);
-        spx(x+4, y, color); spx(x+4, y+1, color);
-        spx(x+1, y, color); spx(x+2, y, color); spx(x+3, y, color); spx(x+4, y, color);
-    }
-    
-    static void drawHouse8bitSprite(int hx, int hy) {
-        for(int i = 0; i < 8; i++) {
-            for(int j = 8-i; j <= 8+i; j++) {
-                spx(hx+j, hy+i, NES_RED);
-            }
-        }
-        for(int j = 8; j < 16; j++) {
-            for(int i = 1; i < 16; i++) {
-                spx(hx+i, hy+j, NES_GRAY);
-            }
-        }
-        for(int j = 10; j < 16; j++) {
-            spx(hx+7, hy+j, NES_BROWN); spx(hx+8, hy+j, NES_BROWN); spx(hx+9, hy+j, NES_BROWN);
-        }
-        spx(hx+9, hy+13, NES_YELLOW);
-        spx(hx+3, hy+10, NES_CYAN); spx(hx+4, hy+10, NES_CYAN);
-        spx(hx+3, hy+11, NES_CYAN); spx(hx+4, hy+11, NES_CYAN);
-        spx(hx+12, hy+10, NES_CYAN); spx(hx+13, hy+10, NES_CYAN);
-        spx(hx+12, hy+11, NES_CYAN); spx(hx+13, hy+11, NES_CYAN);
-        spx(hx+12, hy+2, NES_BROWN); spx(hx+13, hy+2, NES_BROWN);
-        spx(hx+12, hy+3, NES_BROWN); spx(hx+13, hy+3, NES_BROWN);
-        spx(hx+12, hy+4, NES_BROWN); spx(hx+13, hy+4, NES_BROWN);
-    }
-    
-    static void drawTree8bitSprite(int tx, int ty) {
-        spx(tx+2, ty+6, NES_BROWN); spx(tx+3, ty+6, NES_BROWN);
-        spx(tx+2, ty+7, NES_BROWN); spx(tx+3, ty+7, NES_BROWN);
-        spx(tx+2, ty+8, NES_BROWN); spx(tx+3, ty+8, NES_BROWN);
-        for(int i = 0; i < 6; i++) spx(tx+i, ty+5, NES_GREEN);
-        for(int i = 0; i < 6; i++) spx(tx+i, ty+4, NES_GREEN);
-        for(int i = 1; i < 5; i++) spx(tx+i, ty+3, NES_GREEN);
-        for(int i = 1; i < 5; i++) spx(tx+i, ty+2, NES_DKGREEN);
-        spx(tx+2, ty+1, NES_DKGREEN); spx(tx+3, ty+1, NES_DKGREEN);
-        spx(tx+2, ty, NES_GREEN); spx(tx+3, ty, NES_GREEN);
-    }
-    
-    static void drawCloud8bitSprite(int cx, int cy) {
-        for(int i = 1; i < 6; i++) spx(cx+i, cy, NES_WHITE);
-        for(int i = 0; i < 7; i++) spx(cx+i, cy+1, NES_WHITE);
-        for(int i = 1; i < 6; i++) spx(cx+i, cy+2, NES_WHITE);
-    }
-    
-    static void drawSun8bitSprite(int sx, int sy, int frame) {
-        for(int j = 0; j < 4; j++) {
-            for(int i = 0; i < 4; i++) {
-                spx(sx+i, sy+j, NES_YELLOW);
-            }
-        }
-        int rayPhase = (frame / 5) % 2;
-        if(rayPhase == 0) {
-            spx(sx+1, sy-1, NES_YELLOW); spx(sx+2, sy-1, NES_YELLOW);
-            spx(sx-1, sy+1, NES_YELLOW); spx(sx+4, sy+1, NES_YELLOW);
-            spx(sx-1, sy+2, NES_YELLOW); spx(sx+4, sy+2, NES_YELLOW);
-            spx(sx+1, sy+4, NES_YELLOW); spx(sx+2, sy+4, NES_YELLOW);
-        } else {
-            spx(sx-1, sy-1, NES_ORANGE); spx(sx+4, sy-1, NES_ORANGE);
-            spx(sx+1, sy-1, NES_YELLOW); spx(sx+2, sy-1, NES_YELLOW);
-            spx(sx-1, sy+4, NES_ORANGE); spx(sx+4, sy+4, NES_ORANGE);
-            spx(sx+1, sy+4, NES_YELLOW); spx(sx+2, sy+4, NES_YELLOW);
-        }
-    }
-    
-    static void drawGround8bitSprite() {
-        int groundY = 52;
-        for(int y = groundY; y < groundY + 5; y++) {
-            for(int x = 0; x < 120; x++) {
-                spx(x, y, NES_GREEN);
-            }
-        }
-        for(int x = 0; x < 120; x += 5) {
-            spx(x, groundY, NES_DKGREEN);
-            spx(x+2, groundY, NES_DKGREEN);
-        }
-        for(int y = groundY + 5; y < 68; y++) {
-            for(int x = 0; x < 120; x++) {
-                spx(x, y, NES_DKGRAY);
-            }
-        }
-        for(int x = 0; x < 120; x += 10) {
-            for(int i = 0; i < 5; i++) {
-                spx(x+i, groundY + 8, NES_YELLOW);
-            }
-        }
-    }
-    
-    static void show() {
-        // Create full-screen sprite for double buffering (no flicker)
-        LGFX_Sprite frameBuffer(&M5Cardputer.Display);
-        frameBuffer.setColorDepth(16);
-        frameBuffer.createSprite(240, 135);
-        splashSprite = &frameBuffer;
-        
-        // Animation variables
-        int boyX = 35;  // Fixed position - boy does not move
-        int boyY = 32;
-        
-        // Note tracking
-        struct Note8 {
-            int x, y;
-            int type;
-            uint16_t color;
-            int floatY;
-            bool active;
-        };
-        Note8 notes[3] = {{0,0,0,0,0,false},{0,0,0,0,0,false},{0,0,0,0,0,false}};
-        uint16_t noteColors[] = {NES_CYAN, NES_MAGENTA, NES_YELLOW, NES_RED};
-        
-        // Main animation loop - 60 frames
-        for(int frame = 0; frame < 60; frame++) {
-            // Clear entire frame buffer with sky color
-            frameBuffer.fillScreen(NES_SKY);
-            
-            // Draw all static elements to buffer
-            drawGround8bitSprite();
-            drawSun8bitSprite(100, 5, frame);
-            drawCloud8bitSprite(10, 8);
-            drawCloud8bitSprite(60, 12);
-            drawTree8bitSprite(5, 40);
-            drawTree8bitSprite(70, 42);
-            drawHouse8bitSprite(85, 30);
-            
-            // Draw the walking boy (stationary position, only animates walk cycle)
-            drawBoy8bitSprite(boyX, boyY, frame);
-            
-            // Spawn new note every 12 frames
-            if(frame % 12 == 0) {
-                for(int n = 0; n < 3; n++) {
-                    if(!notes[n].active) {
-                        notes[n].x = boyX + 8;
-                        notes[n].y = boyY - 2;
-                        notes[n].type = random(0, 2);
-                        notes[n].color = noteColors[random(0, 4)];
-                        notes[n].floatY = 0;
-                        notes[n].active = true;
-                        break;
-                    }
-                }
-            }
-            
-            // Update and draw notes
-            for(int n = 0; n < 3; n++) {
-                if(notes[n].active) {
-                    int noteDrawX = notes[n].x + ((notes[n].floatY / 3) % 3) - 1;
-                    int noteDrawY = notes[n].y - notes[n].floatY;
-                    
-                    if(noteDrawY > 5 && noteDrawY < 50) {
-                        if(notes[n].type == 0) {
-                            drawNote8bitSprite(noteDrawX, noteDrawY, notes[n].color);
-                        } else {
-                            drawDoubleNote8bitSprite(noteDrawX, noteDrawY, notes[n].color);
-                        }
-                    }
-                    
-                    notes[n].floatY += 1;
-                    if(notes[n].floatY > 25) {
-                        notes[n].active = false;
-                    }
-                }
-            }
-            
-            // Title bar
-            frameBuffer.fillRect(0, 0, 240, 22, NES_BLACK);
-            uint16_t colors[] = {NES_CYAN, NES_WHITE, NES_YELLOW, NES_MAGENTA};
-            uint16_t titleColor = colors[(frame / 10) % 4];
-            frameBuffer.setFont(&fonts::Font0);
-            frameBuffer.setTextColor(titleColor);
-            frameBuffer.setCursor(45, 7);
-            frameBuffer.print("SAM MUSIC PLAYER");
-            spx(10, 3, NES_CYAN); spx(11, 4, NES_MAGENTA); spx(10, 5, NES_YELLOW);
-            spx(108, 3, NES_CYAN); spx(109, 4, NES_MAGENTA); spx(108, 5, NES_YELLOW);
-            
-            // Loading bar
-            frameBuffer.fillRect(75, 118, 90, 16, NES_BLACK);
-            int barW = 80;
-            int progress = (frame * barW) / 60;
-            frameBuffer.drawRect(80, 118, barW, 4, NES_WHITE);
-            if(progress > 2) frameBuffer.fillRect(81, 119, progress - 2, 2, NES_CYAN);
-            
-            frameBuffer.setTextColor(NES_WHITE);
-            frameBuffer.setCursor(80, 124);
-            frameBuffer.print("LOADING");
-            int dots = (frame / 8) % 4;
-            for(int d = 0; d < dots; d++) frameBuffer.print(".");
-            
-            // Press any key hint (blinking)
-            if((frame / 15) % 2 == 0) {
-                frameBuffer.setTextColor(NES_DKGRAY);
-                frameBuffer.setCursor(50, 108);
-                frameBuffer.print("PRESS ANY KEY...");
-            }
-            
-            // Push entire frame to display at once (no flicker!)
-            frameBuffer.pushSprite(0, 0);
-            
-            delay(50);
-            
-            // Check for key press
-            M5Cardputer.update();
-            if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
-                frameBuffer.deleteSprite();
-                if(!BootMenu::show()) {
-                    return;
-                }
-                // Recreate sprite and continue
-                frameBuffer.createSprite(240, 135);
-                splashSprite = &frameBuffer;
-            }
-        }
-        
-        // Delete sprite buffer
-        frameBuffer.deleteSprite();
-        
-        // End animation - flash effect (NES style)
-        for(int i = 0; i < 3; i++) {
-            M5Cardputer.Display.fillScreen(NES_WHITE);
-            delay(50);
-            M5Cardputer.Display.fillScreen(NES_BLACK);
-            delay(50);
-        }
-        
-        M5Cardputer.Display.setBrightness(userSettings.brightness);
-    }
-};
-
-// Static member definition
-LGFX_Sprite* SplashScreen::splashSprite = nullptr;
-
 // ==========================================
 // MAIN SETUP & LOOP
 // ==========================================
@@ -2044,10 +1560,16 @@ void setup() {
     M5Cardputer.Display.setBrightness(userSettings.brightness);
 
     // Show splash screen animation
-    SplashScreen::show();
+    if (!SplashScreen::show(userSettings.brightness)) {
+        // Boot menu triggered restart or mass storage - handled internally
+    }
+    
+    // Initialize USB Host for headphone support
+    USBAudioManager::begin();
     
     out = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
-    out->begin();
+    static_cast<AudioOutputM5Speaker*>(out)->begin();
+    outIsI2S = true;
 
     // Restore g_activePlaylist from saved currentFolder
     g_activePlaylist = getPlaylistPath(userSettings.currentFolder);
@@ -2067,6 +1589,41 @@ void setup() {
 
 void loop() {
     M5Cardputer.update(); server.handleClient(); audioApp.loopTasks();
+    
+    // USB audio periodic tasks
+    static unsigned long lastUsbPacket = 0;
+    if (userSettings.audioOutputMode == 1 && USBAudioManager::isUSBActive) {
+        if (millis() - lastUsbPacket >= 1) {
+            USBAudioManager::submitAudioPacket();
+            lastUsbPacket = millis();
+        }
+    }
+    
+    // Auto-switch to USB when headphones connected and mode is USB
+    static bool lastUsbConnected = false;
+    if (USBAudioManager::isConnected != lastUsbConnected) {
+        lastUsbConnected = USBAudioManager::isConnected;
+        if (USBAudioManager::isConnected && userSettings.audioOutputMode == 1) {
+            // Headphones just connected and USB mode selected - activate streaming
+            USBAudioManager::activateStreaming();
+            // Switch audio output to USB
+            audioApp.stop();
+            out = USBAudioManager::usbOut;
+            outIsI2S = false;
+            if (audioApp.songOffsets.size() > 0) audioApp.play(audioApp.currentIndex);
+        } else if (!USBAudioManager::isConnected && userSettings.audioOutputMode == 1) {
+            // Headphones disconnected - fall back to I2S
+            USBAudioManager::deactivateStreaming();
+            delete out;
+            auto* i2sOut = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
+            i2sOut->begin();
+            out = i2sOut;
+            outIsI2S = true;
+            if (audioApp.songOffsets.size() > 0) audioApp.play(audioApp.currentIndex);
+        }
+        if (currentState == UI_PLAYER && !isScreenOff) UIManager::drawHeader();
+    }
+    
     static int lastPlayingIndex = -1;
     if (lastPlayingIndex != audioApp.currentIndex && currentState == UI_PLAYER && !isScreenOff) {
         lastPlayingIndex = audioApp.currentIndex;
@@ -2165,6 +1722,36 @@ void loop() {
                             userSettings.visMode = (userSettings.visMode + (right?1:-1) + NUM_VIS_MODES) % NUM_VIS_MODES;
                             UIManager::drawBaseUI(); 
                             break;
+                        case 17:
+                            userSettings.loggingEnabled = !userSettings.loggingEnabled;
+                            g_loggingEnabled = userSettings.loggingEnabled;
+                            ConfigManager::save();
+                            break;
+                        case 16: {
+                            // Toggle Audio Output: I2S <-> USB
+                            userSettings.audioOutputMode = (userSettings.audioOutputMode == 0) ? 1 : 0;
+                            if (userSettings.audioOutputMode == 1) {
+                                // Switch to USB output
+                                if (USBAudioManager::isConnected) {
+                                    USBAudioManager::activateStreaming();
+                                    audioApp.stop();
+                                    out = USBAudioManager::usbOut;
+                                    outIsI2S = false;
+                                    if (audioApp.songOffsets.size() > 0) audioApp.play(audioApp.currentIndex);
+                                }
+                            } else {
+                                // Switch to I2S output
+                                USBAudioManager::deactivateStreaming();
+                                audioApp.stop();
+                                auto* i2sOut2 = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
+                                i2sOut2->begin();
+                                out = i2sOut2;
+                                outIsI2S = true;
+                                if (audioApp.songOffsets.size() > 0) audioApp.play(audioApp.currentIndex);
+                            }
+                            ConfigManager::save();
+                            break;
+                        }
                     }
                     UIManager::drawSettings();
                 }
