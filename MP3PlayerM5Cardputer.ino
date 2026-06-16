@@ -85,6 +85,7 @@ const char* helpLines[] = {
   "; / . : Scroll / Navigate",
   "[ / ] : Volume - / +",
   "N / B : Next / Prev Song",
+  "< / ? : Prev / Next Folder",
   "/ / , : Seek +Xs / -Xs",
   "S: Search    F: Shuffle",
   "Esc / ` : Settings",
@@ -109,8 +110,8 @@ const char* helpLines[] = {
   "GH: github.com/sanchitminda",
   "Share your suggestions!"
 };
-const int numHelpLines = 28;
-const int numSettings = 16;   // +1 for Playlist Mode
+const int numHelpLines = 29;
+const int numSettings = 17;   // +1 for Playlist Mode +1 for Fullscreen OFF Vis
 
 // ==========================================
 // GLOBALS
@@ -132,6 +133,7 @@ struct Settings {
     String apPass = "12345678";    
     int powerSaverMode = 0;        
     int seek = 0;
+    bool offVisFullscreen = false;
     String currentFolder = "";    // "" = All Music; "/FolderName" = specific folder
 };
 
@@ -139,6 +141,7 @@ Settings userSettings;
 Preferences preferences;
 WebServer server(80);
 LGFX_Sprite visSprite(&M5Cardputer.Display);
+LGFX_Sprite offVisSprite(&M5Cardputer.Display);
 
 UIState currentState = UI_PLAYER;
 unsigned long lastInputTime = 0;
@@ -156,6 +159,7 @@ String g_searchQuery = "";
 std::vector<int> g_searchResults;  // indices into audioApp.songOffsets
 int g_searchCursor = 0;
 int g_searchScrollOffset = 0;
+int g_offVisAnim = 0;
 
 // ==========================================
 // HARDWARE CLASSES (FFT & SPEAKER)
@@ -243,6 +247,7 @@ public:
         userSettings.themeIndex = preferences.getInt("themeIndex", 0);
         userSettings.visMode = preferences.getInt("visMode", 0);
         userSettings.seek = preferences.getInt("seek", 5);
+        userSettings.offVisFullscreen = preferences.getBool("offVisFull", false);
         userSettings.currentFolder = preferences.getString("curFolder", "");
         preferences.end();
         
@@ -269,6 +274,7 @@ public:
         preferences.putInt("themeIndex", userSettings.themeIndex);
         preferences.putInt("visMode", userSettings.visMode);
         preferences.putInt("seek", userSettings.seek);
+        preferences.putBool("offVisFull", userSettings.offVisFullscreen);
         preferences.putString("curFolder", userSettings.currentFolder);
         preferences.end();
     }
@@ -493,8 +499,12 @@ public:
 
     void seek(int seconds) {
         if (!decoder || !decoder->isRunning() || !id3) return;
+        int32_t size = id3->getSize();
+        if (size <= 0) return;
         int32_t newPos = id3->getPos() + (seconds * 16000);
-        if (newPos < 0) newPos = 0; if (newPos > id3->getSize()) newPos = id3->getSize() - 1000;
+        if (newPos < 0) newPos = 0;
+        int32_t endGuard = std::max<int32_t>(0, size - 2000);
+        if (newPos > endGuard) newPos = endGuard;
         play(currentIndex, newPos);
     }
 
@@ -542,6 +552,32 @@ public:
         root.close();
         return folders;
     }
+
+    bool jumpFolder(int dir) {
+        auto folders = listRootFolders();
+        if (folders.empty()) return false;
+
+ // Find current folder index ("" means All Music)
+        int cur = 0;
+        for (int i = 0; i < (int)folders.size(); ++i) {
+            if (folders[i] == userSettings.currentFolder) { cur = i; break; }
+        }
+
+        // Try moving to next/prev non-empty, wrapping around
+        int tries = folders.size();
+        while (tries--) {
+            cur = (cur + (dir >= 0 ? 1 : -1) + (int)folders.size()) % (int)folders.size();
+            if (loadPlaylistForFolder(folders[cur]) && songOffsets.size() > 0) {
+                play(0);
+                ConfigManager::save();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool nextFolder() { return jumpFolder(+1); }
+    bool prevFolder() { return jumpFolder(-1); }
 };
 
 AudioEngine audioApp;
@@ -554,6 +590,7 @@ public:
     static int settingsCursor;
     static int menuScrollOffset;
     static bool showVisualizer;
+    static bool offVisActive;
     static int wifiCursor;
     static int wifiScrollOffset;
     static int wifiNetworkCount;
@@ -805,6 +842,17 @@ public:
     }
 
     static void drawVisualizer() {
+        static bool offFullActive = false;
+        if (userSettings.visMode == 3 && userSettings.offVisFullscreen) {
+            UIManager::offVisActive = true;
+            UIManager::drawOffVisualizerFull();
+            offFullActive = true;
+            return;
+        } else if (offFullActive) {
+            UIManager::offVisActive = false;
+            offFullActive = false;
+            UIManager::drawBaseUI();
+        }
         if (!audioApp.decoder || !audioApp.decoder->isRunning() || audioApp.isPaused || !showVisualizer) return;
         auto buf = out->getBuffer();
         
@@ -916,6 +964,207 @@ public:
         }
     }
 
+    static void drawOffVisualizerFull() {
+        // Fullscreen OFF-mode overlay split 50/50: Left=Animation, Right=Metadata
+        if (offVisSprite.width() == 0 || offVisSprite.height() == 0) {
+            offVisSprite.setColorDepth(16);
+            offVisSprite.createSprite(M5Cardputer.Display.width(), M5Cardputer.Display.height());
+        }
+        offVisSprite.fillScreen(C_BG_DARK);
+
+        int W = offVisSprite.width();
+        int H = offVisSprite.height();
+        int leftW = W / 2;
+        int rightX = leftW;
+        int margin = 6;
+
+        // LEFT HALF: Music-themed animations (switch with keys 1-4)
+        int animW = leftW - margin * 2;
+        int animH = H - margin * 2;
+        int cx = margin + animW / 2;
+        int cy = margin + animH / 2;
+
+        uint32_t t = millis();
+        float th = t / 300.0f;
+
+        switch (g_offVisAnim) {
+            case 0: { // CD / Disc
+                int r = min(animW, animH) / 2 - 8;
+                offVisSprite.fillCircle(cx, cy, r, C_BG_DARK);
+                offVisSprite.drawCircle(cx, cy, r, C_TEXT_MAIN);
+                // reflective rings
+                for (int k = 1; k <= 3; ++k) {
+                    offVisSprite.drawCircle(cx, cy, r - k * 6, (k % 2) ? C_BG_LIGHT : C_TEXT_DIM);
+                }
+                // spinning ticks
+                int ticks = 16;
+                for (int i = 0; i < ticks; ++i) {
+                    float a = th + i * (2.0f * PI / ticks);
+                    int x1 = cx + cosf(a) * (r - 10);
+                    int y1 = cy + sinf(a) * (r - 10);
+                    int x2 = cx + cosf(a) * (r - 2);
+                    int y2 = cy + sinf(a) * (r - 2);
+                    uint16_t col = (i % 2 == 0) ? C_ACCENT : C_HIGHLIGHT;
+                    offVisSprite.drawLine(x1, y1, x2, y2, col);
+                }
+                // center hub
+                offVisSprite.fillCircle(cx, cy, 5, C_BG_LIGHT);
+                offVisSprite.drawCircle(cx, cy, 8, C_TEXT_DIM);
+                break;
+            }
+            case 1: { // Vinyl record
+                int r = min(animW, animH) / 2 - 6;
+                offVisSprite.fillCircle(cx, cy, r, TFT_BLACK);
+                // grooves
+                for (int gr = r - 2; gr > r - 24; gr -= 2) {
+                    offVisSprite.drawCircle(cx, cy, gr, C_BG_LIGHT);
+                }
+                // label
+                int rl = r / 3;
+                offVisSprite.fillCircle(cx, cy, rl, C_ACCENT);
+                offVisSprite.drawCircle(cx, cy, rl, C_TEXT_MAIN);
+                // rotating highlight dot
+                int xd = cx + cosf(th) * (r - 10);
+                int yd = cy + sinf(th) * (r - 10);
+                offVisSprite.fillCircle(xd, yd, 2, C_HIGHLIGHT);
+                // spindle hole
+                offVisSprite.fillCircle(cx, cy, 3, C_BG_LIGHT);
+                break;
+            }
+            case 2: { // Cassette tape
+                int boxW = animW;
+                int boxH = max(24, animH * 6 / 10);
+                int bx = margin;
+                int by = margin + (animH - boxH) / 2;
+                offVisSprite.fillRoundRect(bx, by, boxW, boxH, 6, C_BG_LIGHT);
+                offVisSprite.drawRoundRect(bx, by, boxW, boxH, 6, C_TEXT_MAIN);
+                // window
+                int wx = bx + boxW * 2 / 10;
+                int ww = boxW * 6 / 10;
+                int wy = by + boxH * 3 / 10;
+                int wh = boxH * 4 / 10;
+                offVisSprite.fillRect(wx, wy, ww, wh, C_BG_DARK);
+                offVisSprite.drawRect(wx, wy, ww, wh, C_TEXT_DIM);
+                // reels
+                int r = min(wh, ww / 3) / 2 - 2;
+                int lx = wx + ww / 4;
+                int rx = wx + ww * 3 / 4;
+                int ry = wy + wh / 2;
+                offVisSprite.drawCircle(lx, ry, r, C_TEXT_MAIN);
+                offVisSprite.drawCircle(rx, ry, r, C_TEXT_MAIN);
+                int spokes = 6;
+                for (int s = 0; s < spokes; ++s) {
+                    float a = th + s * (2.0f * PI / spokes);
+                    int lx2 = lx + cosf(a) * (r - 2);
+                    int ly2 = ry + sinf(a) * (r - 2);
+                    int rx2 = rx + cosf(a) * (r - 2);
+                    int ry2 = ry + sinf(a) * (r - 2);
+                    offVisSprite.drawLine(lx, ry, lx2, ly2, C_HIGHLIGHT);
+                    offVisSprite.drawLine(rx, ry, rx2, ry2, C_HIGHLIGHT);
+                }
+                // tape line
+                offVisSprite.drawLine(lx + r, ry, rx - r, ry, C_ACCENT);
+                break;
+            }
+            case 3: default: { // Equalizer bars
+                int bars = 14;
+                int gap = 2;
+                int bw = max(2, (animW - gap * (bars + 1)) / bars);
+                for (int i = 0; i < bars; ++i) {
+                    float phase = th + i * 0.4f;
+                    float v = (sinf(phase) * 0.5f + 0.5f);
+                    int bh = max(4, (int)(v * (animH - 8)));
+                    int x = margin + gap + i * (bw + gap);
+                    int y = margin + animH - bh;
+                    uint16_t col = (bh < animH * 0.4) ? C_ACCENT : (bh < animH * 0.7 ? C_HIGHLIGHT : TFT_RED);
+                    offVisSprite.fillRect(x, y, bw, bh, col);
+                }
+                break;
+            }
+        }
+
+        // RIGHT HALF: Metadata panel
+        offVisSprite.fillRect(rightX, 0, W - rightX, H, C_BG_LIGHT);
+        offVisSprite.drawFastVLine(rightX, 0, H, C_BG_DARK);
+
+        // Header
+        offVisSprite.setFont(&fonts::lgfxJapanGothic_12);
+        offVisSprite.setTextColor(C_TEXT_MAIN, C_BG_LIGHT);
+        offVisSprite.setCursor(rightX + margin, margin);
+        offVisSprite.print("Now Playing");
+
+        // Metadata
+        String title = audioApp.currentTitle.length() ? audioApp.currentTitle : "";
+        String artist = audioApp.currentArtist.length() ? audioApp.currentArtist : "";
+        String album = audioApp.currentAlbum.length() ? audioApp.currentAlbum : "";
+
+        int textY = margin + 18;
+        offVisSprite.setFont(&fonts::Font0);
+
+        offVisSprite.setTextColor(C_ACCENT, C_BG_LIGHT);
+        offVisSprite.setCursor(rightX + margin, textY);
+        if (title.length() > 0) offVisSprite.print(title.substring(0, 28));
+        textY += 14;
+
+        offVisSprite.setTextColor(C_TEXT_MAIN, C_BG_LIGHT);
+        offVisSprite.setCursor(rightX + margin, textY);
+        if (artist.length() > 0) offVisSprite.print(artist.substring(0, 28));
+        textY += 12;
+
+        offVisSprite.setTextColor(C_TEXT_DIM, C_BG_LIGHT);
+        offVisSprite.setCursor(rightX + margin, textY);
+        if (album.length() > 0) offVisSprite.print(album.substring(0, 28));
+        textY += 12;
+
+        // Filename
+        String __fname = "";
+        if (audioApp.songOffsets.size() > 0) {
+            String __p = audioApp.getSongPath(audioApp.currentIndex);
+            int __slash = __p.lastIndexOf('/');
+            __fname = (__slash >= 0) ? __p.substring(__slash + 1) : __p;
+        }
+        offVisSprite.setTextColor(C_TEXT_MAIN, C_BG_LIGHT);
+        offVisSprite.setCursor(rightX + margin, textY);
+        if (__fname.length() > 0) offVisSprite.print(__fname.substring(0, 28));
+        textY += 16;
+
+        // Progress and time within right half
+        int footerHeight = 12;
+        int barMaxW = (W - rightX) - margin * 2;
+        int barY = H - footerHeight - margin - 6;
+
+        if (audioApp.id3 && audioApp.file) {
+            int curW = (int)((float)audioApp.id3->getPos() / (float)audioApp.id3->getSize() * barMaxW);
+
+            int elapsedSec = audioApp.id3->getPos() / 16000;
+            int totalSec = max(1, (int)(audioApp.id3->getSize() / 16000));
+            char timeStr[24];
+            sprintf(timeStr, "%02d:%02d / %02d:%02d", elapsedSec / 60, elapsedSec % 60, totalSec / 60, totalSec % 60);
+
+            offVisSprite.setFont(&fonts::Font0);
+            offVisSprite.setTextColor(C_TEXT_MAIN, C_BG_LIGHT);
+            offVisSprite.setCursor(rightX + margin, barY - 12);
+            offVisSprite.print(timeStr);
+
+            offVisSprite.fillRect(rightX + margin, barY, barMaxW, 3, C_BG_DARK);
+            offVisSprite.fillRect(rightX + margin, barY, min(curW, barMaxW), 3, C_HIGHLIGHT);
+        }
+
+        // Footer hint
+        {
+            const char* footerMsg = "Press Esc to exit";
+            int footerHeight = 12;
+            offVisSprite.fillRect(0, H - footerHeight, W, footerHeight, C_HEADER);
+            offVisSprite.setFont(&fonts::Font0);
+            offVisSprite.setTextColor(C_TEXT_DIM, C_HEADER);
+            int tw = offVisSprite.textWidth(footerMsg);
+            offVisSprite.setCursor(max(0, (W - tw) / 2), H - footerHeight + 2);
+            offVisSprite.print(footerMsg);
+        }
+
+        offVisSprite.pushSprite(0, 0);
+    }
+
     static void drawSettings() {
         drawPopup("SETTINGS", "Press 'Esc' to Exit");
         int startY = 45, gap = 20;
@@ -947,6 +1196,9 @@ public:
                     if (flabel.length() > 12) flabel = flabel.substring(0, 12) + "~";
                     M5Cardputer.Display.printf("Playlist: %s", flabel.c_str()); break;
                 }
+                case 16:
+                    M5Cardputer.Display.printf("Fullscreen OFF Vis: %s", userSettings.offVisFullscreen ? "ON" : "OFF");
+                    break;
             }
         }
     }
@@ -1084,6 +1336,7 @@ public:
 };
 
 int UIManager::settingsCursor = 0; int UIManager::menuScrollOffset = 0; bool UIManager::showVisualizer = true;
+bool UIManager::offVisActive = false;
 int UIManager::wifiCursor = 0; int UIManager::wifiScrollOffset = 0; int UIManager::wifiNetworkCount = 0;
 int UIManager::helpScrollOffset = 0;
 std::vector<String> UIManager::folderList;
@@ -2068,7 +2321,7 @@ void setup() {
 void loop() {
     M5Cardputer.update(); server.handleClient(); audioApp.loopTasks();
     static int lastPlayingIndex = -1;
-    if (lastPlayingIndex != audioApp.currentIndex && currentState == UI_PLAYER && !isScreenOff) {
+    if (lastPlayingIndex != audioApp.currentIndex && currentState == UI_PLAYER && !isScreenOff && !UIManager::offVisActive) {
         lastPlayingIndex = audioApp.currentIndex;
         UIManager::drawHeader();
         UIManager::drawPlaylist();
@@ -2077,8 +2330,10 @@ void loop() {
     }
     if (currentState == UI_PLAYER && !isScreenOff) {
         static unsigned long lastVis = 0; if (millis() - lastVis > 30) { UIManager::drawVisualizer(); lastVis = millis(); }
-        static unsigned long lastBat = 0; if (millis() - lastBat > 10000) { UIManager::drawBattery(); lastBat = millis(); }
-        static unsigned long lastProg = 0; if (millis() - lastProg > 1000) { UIManager::drawNowPlaying(); lastProg = millis(); }
+        if (!UIManager::offVisActive) {
+            static unsigned long lastBat = 0; if (millis() - lastBat > 10000) { UIManager::drawBattery(); lastBat = millis(); }
+            static unsigned long lastProg = 0; if (millis() - lastProg > 1000) { UIManager::drawNowPlaying(); lastProg = millis(); }
+        }
     }
 
     if (userSettings.timeoutIndex > 0 && !isScreenOff) {
@@ -2112,20 +2367,34 @@ void loop() {
                     }
                     ConfigManager::save(audioApp.id3 ? audioApp.id3->getPos() : 0, audioApp.currentIndex);
                 }
-                else if (M5Cardputer.Keyboard.isKeyPressed('n')) { audioApp.next(); }
-                else if (M5Cardputer.Keyboard.isKeyPressed('b')) { audioApp.prev(); }
+ else if (M5Cardputer.Keyboard.isKeyPressed('n')) {
+                    audioApp.next();
+                }
+                else if (M5Cardputer.Keyboard.isKeyPressed('b')) {
+                    audioApp.prev();
+                }
                 else if (M5Cardputer.Keyboard.isKeyPressed('s')) {
                     g_searchQuery = ""; g_searchResults.clear(); g_searchCursor = 0; g_searchScrollOffset = 0;
                     currentState = UI_SEARCH; UIManager::drawSearch();
                 }
                 else if (M5Cardputer.Keyboard.isKeyPressed('f')) { audioApp.isShuffle = !audioApp.isShuffle; UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed('l')) { audioApp.loopMode = (LoopState)((audioApp.loopMode + 1) % 3); UIManager::drawNowPlaying(); }
-                else if (M5Cardputer.Keyboard.isKeyPressed('v')) { 
-                    userSettings.visMode = (userSettings.visMode + 1) % NUM_VIS_MODES;
-                    UIManager::drawBaseUI(); 
-                }
-                else if (M5Cardputer.Keyboard.isKeyPressed('/')) { audioApp.seek(userSettings.seek); UIManager::drawNowPlaying(); }
-                else if (M5Cardputer.Keyboard.isKeyPressed(',')) { audioApp.seek(-userSettings.seek); UIManager::drawNowPlaying(); }
+                 else if (M5Cardputer.Keyboard.isKeyPressed('v')) { 
+                     userSettings.visMode = (userSettings.visMode + 1) % NUM_VIS_MODES;
+                     UIManager::drawBaseUI(); 
+                 }
+                 else if (M5Cardputer.Keyboard.isKeyPressed('1')) { g_offVisAnim = 0; if (UIManager::offVisActive) UIManager::drawOffVisualizerFull(); }
+                 else if (M5Cardputer.Keyboard.isKeyPressed('2')) { g_offVisAnim = 1; if (UIManager::offVisActive) UIManager::drawOffVisualizerFull(); }
+                 else if (M5Cardputer.Keyboard.isKeyPressed('3')) { g_offVisAnim = 2; if (UIManager::offVisActive) UIManager::drawOffVisualizerFull(); }
+                 else if (M5Cardputer.Keyboard.isKeyPressed('4')) { g_offVisAnim = 3; if (UIManager::offVisActive) UIManager::drawOffVisualizerFull(); }
+                 else if (M5Cardputer.Keyboard.isKeyPressed('?')) { 
+                     if (audioApp.nextFolder()) { UIManager::drawBaseUI(); }
+                 }
+                 else if (M5Cardputer.Keyboard.isKeyPressed('<')) { 
+                     if (audioApp.prevFolder()) { UIManager::drawBaseUI(); }
+                 }
+                 else if (M5Cardputer.Keyboard.isKeyPressed('/')) { audioApp.seek(userSettings.seek); UIManager::drawNowPlaying(); }
+                 else if (M5Cardputer.Keyboard.isKeyPressed(',')) { audioApp.seek(-userSettings.seek); UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed(']')) { M5Cardputer.Speaker.setVolume(min(255, M5Cardputer.Speaker.getVolume() + 10)); UIManager::drawNowPlaying(); }
                 else if (M5Cardputer.Keyboard.isKeyPressed('[')) { M5Cardputer.Speaker.setVolume(max(0, M5Cardputer.Speaker.getVolume() - 10)); UIManager::drawNowPlaying(); }
                 break;
@@ -2164,6 +2433,9 @@ void loop() {
                         case 9:
                             userSettings.visMode = (userSettings.visMode + (right?1:-1) + NUM_VIS_MODES) % NUM_VIS_MODES;
                             UIManager::drawBaseUI(); 
+                            break;
+                        case 16:
+                            userSettings.offVisFullscreen = !userSettings.offVisFullscreen;
                             break;
                     }
                     UIManager::drawSettings();
