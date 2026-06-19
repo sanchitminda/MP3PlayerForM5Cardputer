@@ -111,7 +111,7 @@ const char* helpLines[] = {
   "Share your suggestions!"
 };
 const int numHelpLines = 29;
-const int numSettings = 17;   // +1 for Playlist Mode +1 for Fullscreen OFF Vis
+const int numSettings = 19;   // +1 for Playlist Mode +1 for Fullscreen OFF Vis + Language + Font Size
 
 // ==========================================
 // GLOBALS
@@ -135,6 +135,8 @@ struct Settings {
     int seek = 0;
     bool offVisFullscreen = false;
     String currentFolder = "";    // "" = All Music; "/FolderName" = specific folder
+    String languageCode = "en";   // i18n language code, e.g. "en", "ja"
+    int uiFontSizeIndex = 0;      // 0=Small(12), 1=Medium(16)
 };
 
 Settings userSettings;
@@ -249,6 +251,8 @@ public:
         userSettings.seek = preferences.getInt("seek", 5);
         userSettings.offVisFullscreen = preferences.getBool("offVisFull", false);
         userSettings.currentFolder = preferences.getString("curFolder", "");
+        userSettings.languageCode = preferences.getString("langCode", "en");
+        userSettings.uiFontSizeIndex = preferences.getInt("uiFont", 0);
         preferences.end();
         
         if(userSettings.apSSID.length() == 0) userSettings.apSSID = "Cardputer";
@@ -276,6 +280,8 @@ public:
         preferences.putInt("seek", userSettings.seek);
         preferences.putBool("offVisFull", userSettings.offVisFullscreen);
         preferences.putString("curFolder", userSettings.currentFolder);
+        preferences.putString("langCode", userSettings.languageCode);
+        preferences.putInt("uiFont", userSettings.uiFontSizeIndex);
         preferences.end();
     }
 
@@ -347,6 +353,83 @@ String getPlaylistPath(const String& folder) {
     safe.replace("/", "_");
     return "/pl_" + safe + ".txt";
 }
+
+/* ==========================================
+   I18N (external language file) + Font helpers
+   - Language files live on SD at: /lang/<code>.txt (key=value)
+   - We currently read help.<index> lines only, with fallback to built-in English
+   - Font helper selects a Japanese-capable font and size
+========================================== */
+class I18N {
+public:
+    static std::vector<String> help;
+
+    // Normalize potentially unsupported UTF-8 punctuation to safe ASCII
+    // and strip BOM/non-breaking spaces that can break parsing/rendering.
+    static void normalizeUTF8(String &s) {
+        // Strip UTF-8 BOM if present
+        s.replace("\xEF\xBB\xBF", "");
+        // Replace non-breaking space with normal space
+        s.replace("\xC2\xA0", " ");
+        // Dashes and minus variants -> ASCII hyphen-minus
+        s.replace("\xE2\x80\x90", "-"); // hyphen
+        s.replace("\xE2\x80\x91", "-"); // non-breaking hyphen
+        s.replace("\xE2\x80\x92", "-"); // figure dash
+        s.replace("\xE2\x80\x93", "-"); // en dash
+        s.replace("\xE2\x80\x94", "-"); // em dash
+        s.replace("\xE2\x88\x92", "-"); // minus sign
+        // Fancy quotes -> ASCII
+        s.replace("\xE2\x80\x98", "'"); // left single quote
+        s.replace("\xE2\x80\x99", "'"); // right single quote
+        s.replace("\xE2\x80\x9C", "\""); // left quote
+        s.replace("\xE2\x80\x9D", "\""); // right double quote
+    }
+
+    static void loadHelp(const String &code) {
+        help.clear();
+        // Try selected language, then fallback to
+        String path = "/lang/" + code + ".txt";
+        if (!SD.exists(path)) path = "/lang/en.txt";
+        if (SD.exists(path)) {
+            File f = SD.open(path);
+            if (f) {
+                while (f.available()) {
+                    String line = f.readStringUntil('\n');
+                    normalizeUTF8(line);
+                    line.trim();
+                    if (line.length() == 0 || line.startsWith("#")) continue;
+                    int eq = line.indexOf('=');
+                    if (eq > 0) {
+                        String key = line.substring(0, eq); key.trim();
+                        String val = line.substring(eq + 1);
+                        normalizeUTF8(val);
+                        val.trim();
+                        if (key.startsWith("help.")) {
+                            help.push_back(val);
+                        }
+                    }
+                }
+                f.close();
+            }
+        }
+        // Fallback to compiled English if nothing loaded
+        if (help.empty()) {
+            for (int i = 0; i < numHelpLines; ++i) help.push_back(String(helpLines[i]));
+        }
+    }
+};
+std::vector<String> I18N::help;
+
+class UIFonts {
+public:
+    static const lgfx::IFont* getUIFont() {
+        switch (userSettings.uiFontSizeIndex) {
+            case 1: return &fonts::lgfxJapanGothic_16;
+            default: return &fonts::lgfxJapanGothic_12;
+        }
+    }
+};
+/* ========================================== */
 
 // ==========================================
 // AUDIO ENGINE
@@ -709,19 +792,20 @@ public:
         int lineHeight = 12;
         int visibleLines = 7;
 
-        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setFont(UIFonts::getUIFont());
         M5Cardputer.Display.setTextColor(C_TEXT_MAIN);
 
+        if (I18N::help.empty()) { I18N::loadHelp(userSettings.languageCode); }
         for (int i = 0; i < visibleLines; i++) {
             int idx = helpScrollOffset + i;
-            if (idx >= numHelpLines) break;
+            if (idx >= (int)I18N::help.size()) break;
             M5Cardputer.Display.setCursor(px + 10, contentY + (i * lineHeight));
-            M5Cardputer.Display.print(helpLines[idx]);
+            M5Cardputer.Display.print(I18N::help[idx]);
         }
         
         M5Cardputer.Display.setTextColor(C_ACCENT);
         if (helpScrollOffset > 0) M5Cardputer.Display.drawString("^", px + 190, contentY);
-        if (helpScrollOffset < numHelpLines - visibleLines) M5Cardputer.Display.drawString("v", px + 190, contentY + (visibleLines * lineHeight) - 10);
+        if (helpScrollOffset < (int)I18N::help.size() - visibleLines) M5Cardputer.Display.drawString("v", px + 190, contentY + (visibleLines * lineHeight) - 10);
     }
 
     static void drawPopup(const char* title, const char* footer) {
@@ -734,7 +818,7 @@ public:
 
     static void drawHeader() {
         M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), HEADER_HEIGHT, C_HEADER);
-        M5Cardputer.Display.setFont(&fonts::Font0); 
+        M5Cardputer.Display.setFont(UIFonts::getUIFont());
         String prefix = "Music Player";
         if (userSettings.wifiEnabled) {
             if (userSettings.isAPMode) { prefix = WiFi.softAPIP().toString(); M5Cardputer.Display.setTextColor(TFT_ORANGE, C_HEADER); } 
@@ -784,28 +868,60 @@ public:
     }
 
     static void drawPlaylist() {
-        M5Cardputer.Display.setFont(&fonts::Font0);
+        M5Cardputer.Display.setFont(UIFonts::getUIFont());
         int totalSongs = audioApp.songOffsets.size();
-        int startIdx = max(0, min(audioApp.browserIndex - (MAX_VISIBLE_ROWS / 2), totalSongs - MAX_VISIBLE_ROWS));
+
+        // Dynamic line height and rows based on selected UI font
+        int lineHeight = M5Cardputer.Display.fontHeight() + 3;
+        int listHeight = M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT;
+        int maxRows = max(1, listHeight / lineHeight);
+
+        int startIdx = max(0, min(audioApp.browserIndex - (maxRows / 2), totalSongs - maxRows));
         int yPos = HEADER_HEIGHT + 2, xPos = 0;
-        M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, PLAYLIST_WIDTH, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_LIGHT);
-        M5Cardputer.Display.drawFastVLine(PLAYLIST_WIDTH, HEADER_HEIGHT, M5Cardputer.Display.height() - HEADER_HEIGHT - BOTTOM_BAR_HEIGHT, C_BG_DARK);
 
-        File f = SD.open(g_activePlaylist); if (f && totalSongs > 0) f.seek(audioApp.songOffsets[startIdx]);
+        // Background for playlist pane
+        M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, PLAYLIST_WIDTH, listHeight, C_BG_LIGHT);
+        M5Cardputer.Display.drawFastVLine(PLAYLIST_WIDTH, HEADER_HEIGHT, listHeight, C_BG_DARK);
 
-        for (int i = 0; i < MAX_VISIBLE_ROWS; i++) {
-            int actualIdx = startIdx + i; if (actualIdx >= totalSongs) break;
+        String dispName;
+        File f = SD.open(g_activePlaylist);
+        if (f && totalSongs > 0) f.seek(audioApp.songOffsets[startIdx]);
 
-            if (actualIdx == audioApp.browserIndex) { M5Cardputer.Display.fillRect(xPos + 2, yPos, PLAYLIST_WIDTH - 6, ROW_HEIGHT, C_ACCENT); M5Cardputer.Display.setTextColor(C_BG_DARK); } 
-            else if (actualIdx == audioApp.currentIndex) M5Cardputer.Display.setTextColor(C_PLAYING); 
-            else M5Cardputer.Display.setTextColor(C_TEXT_DIM);
+        for (int i = 0; i < maxRows; i++) {
+            int actualIdx = startIdx + i; 
+            if (actualIdx >= totalSongs) break;
 
-            String dispName = f ? f.readStringUntil('\n') : ""; dispName.trim();
-            int slashIdx = dispName.lastIndexOf('/'); if(slashIdx >= 0) dispName = dispName.substring(slashIdx+1);
+            // Row coloring and selection
+            if (actualIdx == audioApp.browserIndex) { 
+                M5Cardputer.Display.fillRect(xPos + 2, yPos, PLAYLIST_WIDTH - 6, lineHeight - 1, C_ACCENT); 
+                M5Cardputer.Display.setTextColor(C_BG_DARK); 
+            } else if (actualIdx == audioApp.currentIndex) {
+                M5Cardputer.Display.setTextColor(C_PLAYING); 
+            } else {
+                M5Cardputer.Display.setTextColor(C_TEXT_DIM);
+            }
 
-            M5Cardputer.Display.setCursor(xPos + 5, yPos + 3);
-            if (actualIdx == audioApp.currentIndex) M5Cardputer.Display.print("> ");
-            M5Cardputer.Display.print(dispName.substring(0, 16)); yPos += ROW_HEIGHT;
+            // File name
+            dispName = f ? f.readStringUntil('\n') : ""; 
+            dispName.trim();
+            int slashIdx = dispName.lastIndexOf('/'); 
+            if (slashIdx >= 0) dispName = dispName.substring(slashIdx + 1);
+
+            // Compute available width, trim with "~" if needed
+            M5Cardputer.Display.setCursor(xPos + 5, yPos + 2);
+            String prefix = (actualIdx == audioApp.currentIndex) ? "> " : "";
+            if (prefix.length()) M5Cardputer.Display.print(prefix);
+            int availW = PLAYLIST_WIDTH - 10 - M5Cardputer.Display.textWidth(prefix.c_str());
+
+            String name = dispName;
+            int ellW = M5Cardputer.Display.textWidth("~");
+            while (name.length() > 0 && M5Cardputer.Display.textWidth(name.c_str()) > (availW - ellW)) {
+                name.remove(name.length() - 1);
+            }
+            if (name != dispName) name += "~";
+
+            M5Cardputer.Display.print(name);
+            yPos += lineHeight;
         }
         if (f) f.close();
     }
@@ -814,7 +930,7 @@ public:
         int xStart = PLAYLIST_WIDTH + 5, yStart = HEADER_HEIGHT + 5;
         M5Cardputer.Display.fillRect(xStart, yStart, M5Cardputer.Display.width() - xStart, 50, C_BG_DARK);
         
-        M5Cardputer.Display.setFont(&fonts::lgfxJapanGothic_12); M5Cardputer.Display.setTextColor(audioApp.isPaused ? TFT_ORANGE : C_PLAYING);
+        M5Cardputer.Display.setFont(UIFonts::getUIFont()); M5Cardputer.Display.setTextColor(audioApp.isPaused ? TFT_ORANGE : C_PLAYING);
         M5Cardputer.Display.setCursor(xStart + 5, yStart); M5Cardputer.Display.print(audioApp.isPaused ? "[PAUSED]" : "PLAYING >");
 
         M5Cardputer.Display.setCursor(M5Cardputer.Display.width() - 55, yStart);
@@ -1198,6 +1314,12 @@ public:
                 }
                 case 16:
                     M5Cardputer.Display.printf("Fullscreen OFF Vis: %s", userSettings.offVisFullscreen ? "ON" : "OFF");
+                    break;
+                case 17:
+                    M5Cardputer.Display.printf("Language: %s", userSettings.languageCode.c_str());
+                    break;
+                case 18:
+                    M5Cardputer.Display.printf("UI Font Size: %s", userSettings.uiFontSizeIndex == 0 ? "Small" : "Medium");
                     break;
             }
         }
@@ -2367,7 +2489,7 @@ void loop() {
                     }
                     ConfigManager::save(audioApp.id3 ? audioApp.id3->getPos() : 0, audioApp.currentIndex);
                 }
- else if (M5Cardputer.Keyboard.isKeyPressed('n')) {
+                else if (M5Cardputer.Keyboard.isKeyPressed('n')) {
                     audioApp.next();
                 }
                 else if (M5Cardputer.Keyboard.isKeyPressed('b')) {
@@ -2437,6 +2559,13 @@ void loop() {
                         case 16:
                             userSettings.offVisFullscreen = !userSettings.offVisFullscreen;
                             break;
+                        case 17:
+                            userSettings.languageCode = (userSettings.languageCode == "ja") ? "en" : "ja";
+                            I18N::loadHelp(userSettings.languageCode);
+                            break;
+                        case 18:
+                            userSettings.uiFontSizeIndex = (userSettings.uiFontSizeIndex + (right ? 1 : -1) + 2) % 2;
+                            break;
                     }
                     UIManager::drawSettings();
                 }
@@ -2472,7 +2601,8 @@ void loop() {
                 }
                 else if (M5Cardputer.Keyboard.isKeyPressed('.')) {
                     UIManager::helpScrollOffset++;
-                    if (UIManager::helpScrollOffset > numHelpLines - 7) UIManager::helpScrollOffset = numHelpLines - 7;
+                    int maxScroll = max(0, (int)I18N::help.size() - 7);
+                    if (UIManager::helpScrollOffset > maxScroll) UIManager::helpScrollOffset = maxScroll;
                     UIManager::drawHelp();
                 }
                 break;
