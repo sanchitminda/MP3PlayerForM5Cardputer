@@ -1468,7 +1468,7 @@ int UIManager::folderScrollOffset = 0;
 void AudioEngine::MDCallback(void *cbData, const char *type, bool isUnicode, const char *string) {
     if (string[0] == 0) return;
     if (strcmp(type, "Title") == 0) { audioApp.currentTitle = String(string); if (currentState == UI_PLAYER) UIManager::drawNowPlaying(); } 
-    else if (strcmp(type, "Artist") == 0) { audioApp.currentArtist = String(string); }
+    else if (strcmp(type, "Performer") == 0) { audioApp.currentArtist = String(string); }
     else if (strcmp(type, "Album") == 0) { audioApp.currentAlbum = String(string); }
 }
 
